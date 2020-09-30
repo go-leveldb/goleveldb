@@ -1131,9 +1131,9 @@ func (db *DB) tCompaction() {
 			case <-db.closeC:
 				return
 			case x = <-db.tcompCmdC:
-			//case ch := <-db.tcompPauseC:
-			//	db.pauseCompaction(ch)
-			//	continue
+			case ch := <-db.tcompPauseC:
+				db.pauseCompaction(ch)
+				continue
 			case c := <-done:
 				ctx.delete(c)
 				continue
@@ -1159,9 +1159,9 @@ func (db *DB) tCompaction() {
 			case <-db.closeC:
 				return
 			case x = <-db.tcompCmdC:
-			//case ch := <-db.tcompPauseC:
-			//	db.pauseCompaction(ch)
-			//	continue
+			case ch := <-db.tcompPauseC:
+				db.pauseCompaction(ch)
+				continue
 			case c := <-done:
 				ctx.delete(c)
 				continue

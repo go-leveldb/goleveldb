@@ -239,7 +239,6 @@ func (s *session) getMoreRange(v *version, ctx *compactionContext, sourceLevel i
 		for i := p; i < len(t0); i++ {
 			c := newCompaction(s, v, sourceLevel, tFiles{t0[i]}, typ, ctx)
 			if c != nil {
-				// todo try to expand the source files
 				return c
 			}
 		}
@@ -249,7 +248,6 @@ func (s *session) getMoreRange(v *version, ctx *compactionContext, sourceLevel i
 			}
 			c := newCompaction(s, v, sourceLevel, tFiles{t}, typ, ctx)
 			if c != nil {
-				// todo try to expand the source files
 				return c
 			}
 		}
@@ -264,7 +262,6 @@ func (s *session) getMoreRange(v *version, ctx *compactionContext, sourceLevel i
 			}
 			c := newCompaction(s, v, sourceLevel, tFiles{t0[i]}, typ, ctx)
 			if c != nil {
-				// todo try to expand the source files
 				return c
 			}
 		}
