@@ -687,13 +687,6 @@ func (db *DB) tableRangeCompactionAt(level int, umin, umax []byte) error {
 		var comp *compaction
 		if ctx.count() < compLimit {
 			comp = db.s.getCompactionRange(ctx, level, umin, umax)
-
-			// If there is no more available tables to compact,
-			// mark the level as denied temporarily until some
-			// other compactions re-activate.
-			if comp == nil {
-				ctx.denylist[level] = struct{}{}
-			}
 		}
 		if comp != nil {
 			select {
