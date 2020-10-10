@@ -641,7 +641,9 @@ func main() {
 					if mrand.Float64() < rangeCompProb {
 						compRange := dataNsSlice(byte(ns))
 						if err := db.CompactRange(*compRange); err != nil {
-							fatalf(err, "[%02d] RANGE COMPACTION FAILED: %v", ns, err)
+							if err != leveldb.ErrClosed {
+								fatalf(err, "[%02d] RANGE COMPACTION FAILED: %v", ns, err)
+							}
 						}
 					}
 				}
