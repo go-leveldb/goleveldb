@@ -1076,10 +1076,10 @@ func (db *DB) tCompaction() {
 		subWg sync.WaitGroup
 
 		// Various waiting list
-		x        cCmd
-		waitQ    []cCmd // Waiting list will be activated if the level0 tables less then threshold
-		waitAll  []cCmd // Waiting list will be activated iff all compactions have finished.
-		rangeCmd cCmd   // Single range compaction waiting channel
+		x         cCmd
+		waitQ     []cCmd // Waiting list will be activated if the level0 tables less then threshold
+		waitAll   []cCmd // Waiting list will be activated iff all compactions have finished.
+		rangeCmds []cCmd // Range compaction command list
 	)
 	defer func() {
 		// Panic catcher for potential range compaction.
@@ -1102,7 +1102,7 @@ func (db *DB) tCompaction() {
 		if x != nil {
 			x.ack(ErrClosed)
 		}
-		if rangeCmd != nil {
+		for _, rangeCmd := range rangeCmds {
 			rangeCmd.ack(ErrClosed)
 		}
 		db.closeW.Done()
@@ -1123,7 +1123,7 @@ func (db *DB) tCompaction() {
 			level       int
 			table       *tFile
 		)
-		if ctx.count() < compLimit && rangeCmd == nil {
+		if ctx.count() < compLimit && len(rangeCmds) == 0 {
 			needCompact, level, table = db.tableNeedCompaction(ctx)
 		}
 		if needCompact {
@@ -1140,11 +1140,13 @@ func (db *DB) tCompaction() {
 			default:
 			}
 		} else {
-			// If there is a pending range compaction, do it right now
-			if rangeCmd != nil && ctx.count() == 0 {
-				cmd := rangeCmd.(cRange)
-				cmd.ack(db.tableRangeCompaction(cmd.level, cmd.min, cmd.max))
-				rangeCmd = nil
+			// If there are some pending range compactions, schedule them right now
+			if len(rangeCmds) > 0 && ctx.count() == 0 {
+				for _, rangeCmd := range rangeCmds {
+					cmd := rangeCmd.(cRange)
+					cmd.ack(db.tableRangeCompaction(cmd.level, cmd.min, cmd.max))
+				}
+				rangeCmds = nil
 				continue // Re-loop is necessary, try to spin up more compactions
 			}
 			// If the waitAll list is not empty, send the ack if all compactions have finished.
@@ -1177,7 +1179,7 @@ func (db *DB) tCompaction() {
 				}
 			case cRange:
 				if ctx.count() > 0 {
-					rangeCmd = x
+					rangeCmds = append(rangeCmds, x)
 				} else {
 					x.ack(db.tableRangeCompaction(cmd.level, cmd.min, cmd.max))
 				}
