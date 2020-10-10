@@ -471,28 +471,36 @@ func TestCorruptDB_MissingTableFiles(t *testing.T) {
 
 func TestCorruptDB_RecoverTable(t *testing.T) {
 	h := newDbCorruptHarnessWopt(t, &opt.Options{
-		WriteBuffer:         112 * opt.KiB,
-		CompactionTableSize: 90 * opt.KiB,
-		Filter:              filter.NewBloomFilter(10),
+		WriteBuffer:           112 * opt.KiB,
+		CompactionTableSize:   90 * opt.KiB,
+		Filter:                filter.NewBloomFilter(10),
+		CompactionConcurrency: 1, // Disable concurrent range compaction
 	})
 	defer h.close()
 
 	h.build(1000)
 	h.compactMem()
+
 	h.compactRangeAt(0, "", "")
 	h.compactRangeAt(1, "", "")
+
 	seq := h.db.seq
 	time.Sleep(100 * time.Millisecond) // Wait lazy reference finish tasks
 	h.closeDB()
-	h.corrupt(storage.TypeTable, 0, 1000, 1)
-	h.corrupt(storage.TypeTable, 3, 10000, 1)
-	// Corrupted filter shouldn't affect recovery.
-	h.corrupt(storage.TypeTable, 3, 113888, 10)
-	h.corrupt(storage.TypeTable, -1, 20000, 1)
+
+	/*
+			After range compaction, the storage layout looks like
+
+			Level2: [F-24(97469), F-25(97492), F-26(97507), F-27(97516), F-28(69859),
+					 F-29(97547), F-30(17590), F-31(97517), F-32(17588), F-33(97541),
+		             F-34(17592), F-35(97541), F-36(17593), F-37(97539)]
+	*/
+	h.corrupt(storage.TypeTable, 0, 1000, 1)  // Destroy one block(~5 entries)
+	h.corrupt(storage.TypeTable, 3, 10000, 1) // Destroy one block(~5 entries)
 
 	h.recover()
 	if h.db.seq != seq {
 		t.Errorf("invalid seq, want=%d got=%d", seq, h.db.seq)
 	}
-	h.check(985, 985)
+	h.check(990, 990)
 }

@@ -503,7 +503,7 @@ func (o *Options) GetCompactionTotalSize(level int) int64 {
 }
 
 func (o *Options) GetCompactionConcurrency() int {
-	if o != nil || o.CompactionConcurrency <= 0 {
+	if o == nil || o.CompactionConcurrency <= 0 {
 		return runtime.NumCPU()
 	}
 	return o.CompactionConcurrency

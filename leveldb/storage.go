@@ -1,8 +1,9 @@
 package leveldb
 
 import (
-	"github.com/go-leveldb/goleveldb/leveldb/storage"
 	"sync/atomic"
+
+	"github.com/go-leveldb/goleveldb/leveldb/storage"
 )
 
 type iStorage struct {
