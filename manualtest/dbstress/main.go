@@ -47,6 +47,16 @@ var (
 	bpool *util.BufferPool
 )
 
+var bunits = [...]string{"", "Ki", "Mi", "Gi", "Ti"}
+
+func shortenb(bytes int) string {
+	i := 0
+	for ; bytes > 1024 && i < 4; i++ {
+		bytes /= 1024
+	}
+	return fmt.Sprintf("%d%sB", bytes, bunits[i])
+}
+
 type arrayInt []int
 
 func (a arrayInt) String() string {
@@ -443,8 +453,19 @@ func main() {
 			writeDelay, _ := db.GetProperty("leveldb.writedelay")
 			ioStats, _ := db.GetProperty("leveldb.iostats")
 			compCount, _ := db.GetProperty("leveldb.compcount")
-			log.Printf("> BlockCache=%s OpenedTables=%s AliveSnaps=%s AliveIter=%s BlockPool=%q WriteDelay=%q IOStats=%q CompCount=%q",
-				cachedblock, openedtables, alivesnaps, aliveiters, blockpool, writeDelay, ioStats, compCount)
+
+			fds, _ := db.StorageFiles(storage.TypeTable)
+
+			var limit []byte
+			for i := 0; i < keyLen; i++ {
+				limit = append(limit, 0xff)
+			}
+			totalSize, _ := db.SizeOf([]util.Range{{
+				Start: nil,
+				Limit: limit,
+			}})
+			log.Printf("> BlockCache=%s OpenedTables=%s AliveSnaps=%s AliveIter=%s BlockPool=%q WriteDelay=%q IOStats=%q CompCount=%q Tables=%d TotalSize=%s",
+				cachedblock, openedtables, alivesnaps, aliveiters, blockpool, writeDelay, ioStats, compCount, len(fds), shortenb(int(totalSize[0])))
 			log.Print("------------------------")
 		}
 	}()
