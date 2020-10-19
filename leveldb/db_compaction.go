@@ -642,39 +642,94 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 func (db *DB) tableRangeCompaction(level int, umin, umax []byte) error {
 	db.logf("table@compaction range L%d %q:%q", level, umin, umax)
 	if level >= 0 {
-		if c := db.s.getCompactionRange(level, umin, umax, true); c != nil {
-			db.tableCompaction(c, true, nil)
-		}
+		return db.tableRangeCompactionAt(level, umin, umax)
 	} else {
-		// Retry until nothing to compact.
-		for {
-			compacted := false
-
-			// Scan for maximum level with overlapped tables.
-			v := db.s.version()
-			m := 1
-			for i := m; i < len(v.levels); i++ {
-				tables := v.levels[i]
-				if tables.overlaps(db.s.icmp, umin, umax, false) {
-					m = i
-				}
+		// Scan for maximum level with overlapped tables.
+		v := db.s.version()
+		m := 1
+		for i := m; i < len(v.levels); i++ {
+			tables := v.levels[i]
+			if tables.overlaps(db.s.icmp, umin, umax, false) {
+				m = i
 			}
-			v.release()
-
-			for level := 0; level < m; level++ {
-				if c := db.s.getCompactionRange(level, umin, umax, false); c != nil {
-					db.tableCompaction(c, true, nil)
-					compacted = true
-				}
+		}
+		v.release()
+		for i := 0; i < m; i++ {
+			err := db.tableRangeCompactionAt(i, umin, umax)
+			if err != nil {
+				return err
 			}
+		}
+		return nil
+	}
+}
 
-			if !compacted {
-				break
+// tableRangeCompactionAt runs range compaction at the specific level.
+func (db *DB) tableRangeCompactionAt(level int, umin, umax []byte) error {
+	var (
+		// The maximum number of compactions are allowed to run concurrently.
+		// The default value is the CPU core number.
+		compLimit = db.s.o.GetCompactionConcurrency()
+
+		// Compaction context includes all ongoing compactions.
+		ctx = &compactionContext{
+			sorted:   make(map[int][]*compaction),
+			fifo:     make(map[int][]*compaction),
+			icmp:     db.s.icmp,
+			denylist: make(map[int]struct{}),
+		}
+		done  = make(chan *compaction)
+		subWg sync.WaitGroup
+	)
+	defer subWg.Wait()
+
+	for {
+		var comp *compaction
+		if ctx.count() < compLimit {
+			comp = db.s.getCompactionRange(ctx, level, umin, umax)
+		}
+		if comp != nil {
+			select {
+			case <-db.closeC:
+				return ErrClosed
+			case c := <-done:
+				ctx.delete(c)
+				continue
+			default:
+			}
+			ctx.add(comp)
+			subWg.Add(1)
+			go func() {
+				// Catch the panic in its own goroutine.
+				defer func() {
+					if x := recover(); x != nil {
+						if x != errCompactionTransactExiting {
+							panic(x)
+						}
+					}
+				}()
+				defer subWg.Done()
+
+				db.tableCompaction(comp, true, func(c *compaction) {
+					select {
+					case done <- c:
+					case <-db.closeC:
+					}
+				})
+			}()
+		} else {
+			// All overlapped tables have been merged to the parent level
+			if ctx.count() == 0 {
+				return nil
+			}
+			select {
+			case <-db.closeC:
+				return ErrClosed
+			case c := <-done:
+				ctx.delete(c)
 			}
 		}
 	}
-
-	return nil
 }
 
 // tableNeedCompaction returns the indicator whether system needs compaction.
@@ -1014,10 +1069,10 @@ func (db *DB) tCompaction() {
 		subWg sync.WaitGroup
 
 		// Various waiting list
-		x        cCmd
-		waitQ    []cCmd // Waiting list will be activated if the level0 tables less then threshold
-		waitAll  []cCmd // Waiting list will be activated iff all compactions have finished.
-		rangeCmd cCmd   // Single range compaction waiting channel
+		x         cCmd
+		waitQ     []cCmd // Waiting list will be activated if the level0 tables less then threshold
+		waitAll   []cCmd // Waiting list will be activated iff all compactions have finished.
+		rangeCmds []cCmd // Range compaction command list
 	)
 	defer func() {
 		// Panic catcher for potential range compaction.
@@ -1040,7 +1095,7 @@ func (db *DB) tCompaction() {
 		if x != nil {
 			x.ack(ErrClosed)
 		}
-		if rangeCmd != nil {
+		for _, rangeCmd := range rangeCmds {
 			rangeCmd.ack(ErrClosed)
 		}
 		db.closeW.Done()
@@ -1061,7 +1116,7 @@ func (db *DB) tCompaction() {
 			level       int
 			table       *tFile
 		)
-		if ctx.count() < compLimit && rangeCmd == nil {
+		if ctx.count() < compLimit && len(rangeCmds) == 0 {
 			needCompact, level, table = db.tableNeedCompaction(ctx)
 		}
 		if needCompact {
@@ -1078,11 +1133,13 @@ func (db *DB) tCompaction() {
 			default:
 			}
 		} else {
-			// If there is a pending range compaction, do it right now
-			if rangeCmd != nil && ctx.count() == 0 {
-				cmd := rangeCmd.(cRange)
-				cmd.ack(db.tableRangeCompaction(cmd.level, cmd.min, cmd.max))
-				rangeCmd = nil
+			// If there are some pending range compactions, schedule them right now
+			if len(rangeCmds) > 0 && ctx.count() == 0 {
+				for _, rangeCmd := range rangeCmds {
+					cmd := rangeCmd.(cRange)
+					cmd.ack(db.tableRangeCompaction(cmd.level, cmd.min, cmd.max))
+				}
+				rangeCmds = nil
 				continue // Re-loop is necessary, try to spin up more compactions
 			}
 			// If the waitAll list is not empty, send the ack if all compactions have finished.
@@ -1115,7 +1172,7 @@ func (db *DB) tCompaction() {
 				}
 			case cRange:
 				if ctx.count() > 0 {
-					rangeCmd = x
+					rangeCmds = append(rangeCmds, x)
 				} else {
 					x.ack(db.tableRangeCompaction(cmd.level, cmd.min, cmd.max))
 				}

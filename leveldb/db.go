@@ -1136,6 +1136,12 @@ func (db *DB) SizeOf(ranges []util.Range) (Sizes, error) {
 	return sizes, nil
 }
 
+// StorageFiles is a helper function which should only be used in
+// testing. It can return a list of fds of given file type.
+func (db *DB) StorageFiles(typ storage.FileType) ([]storage.FileDesc, error) {
+	return db.s.stor.List(typ)
+}
+
 // Close closes the DB. This will also releases any outstanding snapshot,
 // abort any in-flight compaction and discard open transaction.
 //

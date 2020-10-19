@@ -36,6 +36,7 @@ var (
 	numKeys                = arrayInt{100000, 1332, 531, 1234, 9553, 1024, 35743}
 	httpProf               = "127.0.0.1:5454"
 	transactionProb        = 0.5
+	rangeCompProb          = 0.005
 	enableBlockCache       = false
 	enableCompression      = false
 	enableBufferPool       = false
@@ -45,6 +46,16 @@ var (
 
 	bpool *util.BufferPool
 )
+
+var bunits = [...]string{"", "Ki", "Mi", "Gi", "Ti"}
+
+func shortenb(bytes int) string {
+	i := 0
+	for ; bytes > 1024 && i < 4; i++ {
+		bytes /= 1024
+	}
+	return fmt.Sprintf("%d%sB", bytes, bunits[i])
+}
 
 type arrayInt []int
 
@@ -83,6 +94,7 @@ func init() {
 	flag.Var(&numKeys, "numkeys", "num keys")
 	flag.StringVar(&httpProf, "httpprof", httpProf, "http pprof listen addr")
 	flag.Float64Var(&transactionProb, "transactionprob", transactionProb, "probablity of writes using transaction")
+	flag.Float64Var(&rangeCompProb, "rangecompprob", rangeCompProb, "probablity of running range compaction after deletion")
 	flag.BoolVar(&enableBufferPool, "enablebufferpool", enableBufferPool, "enable buffer pool")
 	flag.BoolVar(&enableBlockCache, "enableblockcache", enableBlockCache, "enable block cache")
 	flag.BoolVar(&enableCompression, "enablecompression", enableCompression, "enable block compression")
@@ -384,6 +396,8 @@ func main() {
 		writeAckAck = make(chan struct{})
 	)
 
+	// Writer, two modes available: batch write and transaction write.
+	// Schedule the transaction write by the specific probability.
 	go func() {
 		for b := range writeReq {
 
@@ -412,6 +426,7 @@ func main() {
 		}
 	}()
 
+	// Periodically print the stress test statistic.
 	go func() {
 		for {
 			time.Sleep(3 * time.Second)
@@ -438,25 +453,45 @@ func main() {
 			writeDelay, _ := db.GetProperty("leveldb.writedelay")
 			ioStats, _ := db.GetProperty("leveldb.iostats")
 			compCount, _ := db.GetProperty("leveldb.compcount")
-			log.Printf("> BlockCache=%s OpenedTables=%s AliveSnaps=%s AliveIter=%s BlockPool=%q WriteDelay=%q IOStats=%q CompCount=%q",
-				cachedblock, openedtables, alivesnaps, aliveiters, blockpool, writeDelay, ioStats, compCount)
+
+			fds, _ := db.StorageFiles(storage.TypeTable)
+
+			var limit []byte
+			for i := 0; i < keyLen; i++ {
+				limit = append(limit, 0xff)
+			}
+			totalSize, _ := db.SizeOf([]util.Range{{
+				Start: nil,
+				Limit: limit,
+			}})
+			var size int64
+			if len(totalSize) > 0 {
+				size = totalSize[0]
+			}
+			log.Printf("> BlockCache=%s OpenedTables=%s AliveSnaps=%s AliveIter=%s BlockPool=%q WriteDelay=%q IOStats=%q CompCount=%q Tables=%d TotalSize=%s",
+				cachedblock, openedtables, alivesnaps, aliveiters, blockpool, writeDelay, ioStats, compCount, len(fds), shortenb(int(size)))
 			log.Print("------------------------")
 		}
 	}()
 
+	// Stress test main thread which is responsible for:
+	//
+	// - construct the write operations with the notion of "namespace"
+	// - delete the written entries and ensure they are indeed deleted
+	// - query via snapshot, ensure the data integrity
 	for ns, numKey := range numKeys {
 		func(ns, numKey int) {
 			log.Printf("[%02d] STARTING: numKey=%d", ns, numKey)
 
 			keys := make([][]byte, numKey)
 			for i := range keys {
-				keys[i] = randomData(nil, byte(ns), 1, uint32(i), keyLen) // Key, NS=ns, PREFIX=1
+				keys[i] = randomData(nil, byte(ns), 1, uint32(i), keyLen) // Key, NS=ns, PREFIX=1, INDEX=i
 			}
 
 			// Write and overwrite non-stop.
 			wg.Add(1)
 			go func() {
-				var wi uint32
+				var wi uint32 // Write iteration
 				defer func() {
 					log.Printf("[%02d] WRITER DONE #%d", ns, wi)
 					wg.Done()
@@ -472,7 +507,7 @@ func main() {
 
 					b.Reset()
 					for _, k1 := range keys {
-						k2 = randomData(k2, byte(ns), 2, wi, keyLen)   // Key2, NS=ns, PREFIX=2, INDEX=wi
+						k2 = randomData(k2, byte(ns), 2, wi, keyLen)   // Key2,  NS=ns, PREFIX=2, INDEX=wi
 						v2 = randomData(v2, byte(ns), 3, wi, valueLen) // Value, NS=ns, PREFIX=3, INDEX=wi
 						b.Put(k2, v2)                                  // K2 => V2
 						b.Put(k1, k2)                                  // K1 => K2
@@ -514,7 +549,7 @@ func main() {
 						stopi := snapwi + 3
 						for (ri < 3 || atomic.LoadUint32(&wi) < stopi) && atomic.LoadUint32(&done) == 0 {
 							var n int
-							iter := snap.NewIterator(dataPrefixSlice(byte(ns), 1), nil)
+							iter := snap.NewIterator(dataPrefixSlice(byte(ns), 1), nil) // NS=ns, PREFIX=1
 							iterStat.start()
 							for iter.Next() {
 								k1 := iter.Key()   // Read k1
@@ -531,7 +566,7 @@ func main() {
 								}
 
 								getStat.start()
-								v2, err := snap.Get(k2, nil)
+								v2, err := snap.Get(k2, nil) // Read v2
 								if err != nil {
 									fatalf(err, "[%02d] READER #%d.%d K%d snap.Get: %v\nk1: %x\n -> k2: %x", ns, snapwi, ri, n, err, k1, k2)
 								}
@@ -579,7 +614,7 @@ func main() {
 				for atomic.LoadUint32(&done) == 0 {
 					var n int
 					delB.Reset()
-					iter := db.NewIterator(dataNsSlice(byte(ns)), nil)
+					iter := db.NewIterator(dataNsSlice(byte(ns)), nil) // NS=ns, read from the LATEST snapshot
 					iterStat.start()
 					for iter.Next() && atomic.LoadUint32(&done) == 0 {
 						k := iter.Key()   // Read K1
@@ -596,7 +631,7 @@ func main() {
 								}
 							}
 						}
-
+						// Delete all k2->v2 as well as a part of k1->k2
 						if dataPrefix(k) == 2 || mrand.Int()%999 == 0 {
 							delB.Delete(k)
 						}
@@ -626,6 +661,16 @@ func main() {
 					}
 
 					i++
+
+					// In the end, trigger a range compaction if necessary.
+					if mrand.Float64() < rangeCompProb {
+						compRange := dataNsSlice(byte(ns))
+						if err := db.CompactRange(*compRange); err != nil {
+							if err != leveldb.ErrClosed {
+								fatalf(err, "[%02d] RANGE COMPACTION FAILED: %v", ns, err)
+							}
+						}
+					}
 				}
 			}()
 		}(ns, numKey)

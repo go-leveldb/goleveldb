@@ -178,27 +178,21 @@ func (s *session) pickCompactionByTable(level int, table *tFile, ctx *compaction
 	return newCompaction(s, v, level, []*tFile{table}, seekCompaction, ctx)
 }
 
-// Create compaction from given level and range; need external synchronization.
-func (s *session) getCompactionRange(sourceLevel int, umin, umax []byte, noLimit bool) *compaction {
-	v := s.version()
-
-	if sourceLevel >= len(v.levels) {
-		v.release()
-		return nil
-	}
-
+func (s *session) getFirstRange(v *version, ctx *compactionContext, sourceLevel int, umin, umax []byte, typ int, limit int64) (comp *compaction) {
+	defer func() {
+		if comp == nil {
+			v.release()
+		}
+	}()
 	t0 := v.levels[sourceLevel].getOverlaps(nil, s.icmp, umin, umax, sourceLevel == 0)
 	if len(t0) == 0 {
-		v.release()
 		return nil
 	}
-
 	// Avoid compacting too much in one shot in case the range is large.
 	// But we cannot do this for level-0 since level-0 files can overlap
 	// and we must not pick one file and drop another older file if the
 	// two files overlap.
-	if !noLimit && sourceLevel > 0 {
-		limit := int64(v.s.o.GetCompactionSourceLimit(sourceLevel))
+	if sourceLevel != 0 {
 		total := int64(0)
 		for i, t := range t0 {
 			total += t.size
@@ -209,12 +203,93 @@ func (s *session) getCompactionRange(sourceLevel int, umin, umax []byte, noLimit
 			}
 		}
 	}
+	return newCompaction(s, v, sourceLevel, t0, typ, ctx)
+}
 
+func (s *session) getMoreRange(v *version, ctx *compactionContext, sourceLevel int, umin, umax []byte, typ int, sourceLimit int64) (comp *compaction) {
+	defer func() {
+		if comp == nil {
+			v.release()
+		}
+	}()
+
+	// Determine the search space for next potential range compaction
+	cs := ctx.get(sourceLevel)
+	if len(cs) == 0 {
+		return nil // Should never happen
+	}
+	limit := cs[len(cs)-1].imax
+	start := cs[0].imax
+
+	var reverse bool
+	if s.icmp.Compare(start, limit) > 0 {
+		reverse = true
+		start, limit = limit, start
+	}
+
+	t0 := v.levels[sourceLevel].getOverlaps(nil, s.icmp, umin, umax, sourceLevel == 0)
+	if len(t0) == 0 {
+		return nil
+	}
+
+	if !reverse {
+		p := sort.Search(len(t0), func(i int) bool {
+			return s.icmp.Compare(t0[i].imax, limit) > 0
+		})
+		for i := p; i < len(t0); i++ {
+			c := newCompaction(s, v, sourceLevel, tFiles{t0[i]}, typ, ctx)
+			if c != nil {
+				return c
+			}
+		}
+		for _, t := range t0 {
+			if s.icmp.Compare(t.imax, start) >= 0 {
+				break
+			}
+			c := newCompaction(s, v, sourceLevel, tFiles{t}, typ, ctx)
+			if c != nil {
+				return c
+			}
+		}
+		return nil
+	} else {
+		p := sort.Search(len(t0), func(i int) bool {
+			return s.icmp.Compare(t0[i].imax, start) > 0
+		})
+		for i := p; i < len(t0); i++ {
+			if s.icmp.Compare(t0[i].imax, limit) >= 0 {
+				break
+			}
+			c := newCompaction(s, v, sourceLevel, tFiles{t0[i]}, typ, ctx)
+			if c != nil {
+				return c
+			}
+		}
+		return nil
+	}
+}
+
+// Create compaction from given level and range; need external synchronization.
+func (s *session) getCompactionRange(ctx *compactionContext, sourceLevel int, umin, umax []byte) *compaction {
+	v := s.version()
+
+	if sourceLevel >= len(v.levels) {
+		v.release()
+		return nil
+	}
 	typ := level0Compaction
 	if sourceLevel != 0 {
 		typ = nonLevel0Compaction
 	}
-	return newCompaction(s, v, sourceLevel, t0, typ, nil)
+	limit := int64(v.s.o.GetCompactionSourceLimit(sourceLevel))
+	if ctx.count() == 0 {
+		return s.getFirstRange(v, ctx, sourceLevel, umin, umax, typ, limit)
+	}
+	if sourceLevel == 0 {
+		v.release()
+		return nil
+	}
+	return s.getMoreRange(v, ctx, sourceLevel, umin, umax, typ, limit)
 }
 
 func newCompaction(s *session, v *version, sourceLevel int, t0 tFiles, typ int, ctx *compactionContext) *compaction {

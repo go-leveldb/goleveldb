@@ -2924,3 +2924,38 @@ func TestDB_GracefulClose(t *testing.T) {
 	iter.Release()
 	closeWait.Wait()
 }
+
+func TestRangeCompaction_AfterSnapshot(t *testing.T) {
+	h := newDbCorruptHarnessWopt(t, &opt.Options{
+		CompactionConcurrency:  1, // Disable concurrent range compaction
+		DisableSeeksCompaction: true,
+	})
+	defer h.close()
+
+	h.put("a", "v")
+	h.put("b", "v")
+	h.put("c", "v")
+	h.put("d", "v")
+	h.compactMem()
+	if h.getTablesPerLevel() != "1" {
+		t.Fatalf("Failed to dump file")
+	}
+	// Hold the snapshot
+	snap, _ := h.db.GetSnapshot()
+	defer snap.Release()
+	h.delete("a")
+	h.delete("b")
+	h.compactMem()
+	if h.getTablesPerLevel() != "2" {
+		t.Fatalf("Failed to dump file")
+	}
+	// Range compact all level0 files
+	h.compactRange("", "")
+	if h.getTablesPerLevel() != "0,1" {
+		t.Fatalf("Failed to range-compact files")
+	}
+	h.allEntriesFor("a", "[ DEL, v ]")
+	h.allEntriesFor("b", "[ DEL, v ]")
+	h.allEntriesFor("c", "[ v ]")
+	h.allEntriesFor("d", "[ v ]")
+}
