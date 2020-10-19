@@ -36,7 +36,7 @@ var (
 	numKeys                = arrayInt{100000, 1332, 531, 1234, 9553, 1024, 35743}
 	httpProf               = "127.0.0.1:5454"
 	transactionProb        = 0.5
-	rangeCompProb          = 0.5
+	rangeCompProb          = 0.05
 	enableBlockCache       = false
 	enableCompression      = false
 	enableBufferPool       = false
