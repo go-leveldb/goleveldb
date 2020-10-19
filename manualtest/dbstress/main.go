@@ -36,7 +36,7 @@ var (
 	numKeys                = arrayInt{100000, 1332, 531, 1234, 9553, 1024, 35743}
 	httpProf               = "127.0.0.1:5454"
 	transactionProb        = 0.5
-	rangeCompProb          = 0.05
+	rangeCompProb          = 0.005
 	enableBlockCache       = false
 	enableCompression      = false
 	enableBufferPool       = false
@@ -464,8 +464,12 @@ func main() {
 				Start: nil,
 				Limit: limit,
 			}})
+			var size int64
+			if len(totalSize) > 0 {
+				size = totalSize[0]
+			}
 			log.Printf("> BlockCache=%s OpenedTables=%s AliveSnaps=%s AliveIter=%s BlockPool=%q WriteDelay=%q IOStats=%q CompCount=%q Tables=%d TotalSize=%s",
-				cachedblock, openedtables, alivesnaps, aliveiters, blockpool, writeDelay, ioStats, compCount, len(fds), shortenb(int(totalSize[0])))
+				cachedblock, openedtables, alivesnaps, aliveiters, blockpool, writeDelay, ioStats, compCount, len(fds), shortenb(int(size)))
 			log.Print("------------------------")
 		}
 	}()
