@@ -311,6 +311,14 @@ type compaction struct {
 	levels        [2]tFiles
 	maxGPOverlaps int64
 
+	// Compaction range. Only useful for level0 compaction.
+	// For the level0 compaction, a big one can be separated
+	// into several small one. While the input is still shared
+	// because the level0 files are overlapped. So in this case
+	// the range is used to restrict the input range.
+	rangeStart []byte
+	rangeLimit []byte
+
 	gp                tFiles
 	gpi               int
 	seenKey           bool

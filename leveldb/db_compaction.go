@@ -455,6 +455,8 @@ func (b *tableCompactionBuilder) cleanup() {
 	}
 }
 
+// TODO @rjl493456442 why the compaction can be rerun over and over again.
+// Sent the email probably.
 func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) error {
 	snapResumed := b.snapIter > 0
 	hasLastUkey := b.snapHasLastUkey // The key might has zero length, so this is necessary.
@@ -931,6 +933,9 @@ func (x *compactionsSortByKey) Less(i, j int) bool {
 	return x.lessByKey(x.icmp, i, j)
 }
 
+// TODO @rjl493456442 compaction has weight. E.g.
+// The level0 compaction has higher weight if it's "concurrent-able".
+// The non-level0 compaction has the default 1 weight.
 type compactionContext struct {
 	sorted   map[int][]*compaction
 	fifo     map[int][]*compaction
