@@ -689,11 +689,16 @@ func (db *DB) tableRangeCompactionAt(level int, umin, umax []byte) error {
 			comp = db.s.getCompactionRange(ctx, level, umin, umax)
 		}
 		if comp != nil {
+			// If the compaction object is eventually discarded,
+			// don't forget to release it in order to release the
+			// underlying version.
 			select {
 			case <-db.closeC:
+				comp.release()
 				return ErrClosed
 			case c := <-done:
 				ctx.delete(c)
+				comp.release()
 				continue
 			default:
 			}
