@@ -594,6 +594,27 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 		db.compactionCommit("table-move", rec)
 		return
 	}
+	// If it's level0 compaction
+	// - create a list of "SUB STAT" for recording output size and running time
+	// - create a list of "SUB RECORD" for recording output fds
+	// - calculate the concurrency
+	//   * level-source + level-parent total size,
+	//   	e.g. more than 12MB, one more concurrency
+	//           limited by the CPU.number
+	//           user can customize the compaction weight calculation
+	// - calculate the compaction interval
+	//      e.g. the concurrency is 4, split the level-parent files
+	//           to 4 group
+	//      interval: [0000, x1-1]
+	//      interval: [x1, x2-1]
+	//      interval: [x2, x3-1]
+	//      interval: [x3, ffff]
+	//
+	// - schedule all compaction builders
+	//
+	// - merge all "SUB STAT"
+	// - merge all "SUB RECORD"
+	// - commit
 
 	var stats [2]cStatStaging
 	for i, tables := range c.levels {
