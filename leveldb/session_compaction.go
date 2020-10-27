@@ -179,11 +179,6 @@ func (s *session) pickCompactionByTable(level int, table *tFile, ctx *compaction
 }
 
 func (s *session) getFirstRange(v *version, ctx *compactionContext, sourceLevel int, umin, umax []byte, typ int, limit int64) (comp *compaction) {
-	defer func() {
-		if comp == nil {
-			v.release()
-		}
-	}()
 	t0 := v.levels[sourceLevel].getOverlaps(nil, s.icmp, umin, umax, sourceLevel == 0)
 	if len(t0) == 0 {
 		return nil
@@ -207,12 +202,6 @@ func (s *session) getFirstRange(v *version, ctx *compactionContext, sourceLevel 
 }
 
 func (s *session) getMoreRange(v *version, ctx *compactionContext, sourceLevel int, umin, umax []byte, typ int, sourceLimit int64) (comp *compaction) {
-	defer func() {
-		if comp == nil {
-			v.release()
-		}
-	}()
-
 	// Determine the search space for next potential range compaction
 	cs := ctx.get(sourceLevel)
 	if len(cs) == 0 {
@@ -270,11 +259,14 @@ func (s *session) getMoreRange(v *version, ctx *compactionContext, sourceLevel i
 }
 
 // Create compaction from given level and range; need external synchronization.
-func (s *session) getCompactionRange(ctx *compactionContext, sourceLevel int, umin, umax []byte) *compaction {
+func (s *session) getCompactionRange(ctx *compactionContext, sourceLevel int, umin, umax []byte) (comp *compaction) {
 	v := s.version()
-
+	defer func() {
+		if comp == nil {
+			v.release()
+		}
+	}()
 	if sourceLevel >= len(v.levels) {
-		v.release()
 		return nil
 	}
 	typ := level0Compaction
@@ -286,7 +278,6 @@ func (s *session) getCompactionRange(ctx *compactionContext, sourceLevel int, um
 		return s.getFirstRange(v, ctx, sourceLevel, umin, umax, typ, limit)
 	}
 	if sourceLevel == 0 {
-		v.release()
 		return nil
 	}
 	return s.getMoreRange(v, ctx, sourceLevel, umin, umax, typ, limit)
