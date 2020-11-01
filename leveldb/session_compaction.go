@@ -291,41 +291,18 @@ func newCompaction(s *session, v *version, sourceLevel int, t0 tFiles, typ int, 
 		sourceLevel:   sourceLevel,
 		levels:        [2]tFiles{t0, nil},
 		maxGPOverlaps: int64(s.o.GetCompactionGPOverlaps(sourceLevel)),
-		tPtrs:         make([]int, len(v.levels)),
 	}
 	if !c.expand(ctx) {
 		return nil
 	}
-	c.save()
 	return c
 }
 
-// compaction represent a compaction state.
-type compaction struct {
-	s *session
-	v *version
-
-	id            int64
-	typ           int
-	sourceLevel   int
-	levels        [2]tFiles
-	maxGPOverlaps int64
-
-	// Compaction range. Only useful for level0 compaction.
-	// For the level0 compaction, a big one can be separated
-	// into several small one. While the input is still shared
-	// because the level0 files are overlapped. So in this case
-	// the range is used to restrict the input range.
-	rangeStart []byte
-	rangeLimit []byte
-
-	gp                tFiles
+type compactionDynamicContext struct {
 	gpi               int
 	seenKey           bool
 	gpOverlappedBytes int64
-	imin, imax        internalKey
 	tPtrs             []int
-	released          bool
 
 	snapGPI               int
 	snapSeenKey           bool
@@ -333,18 +310,88 @@ type compaction struct {
 	snapTPtrs             []int
 }
 
-func (c *compaction) save() {
-	c.snapGPI = c.gpi
-	c.snapSeenKey = c.seenKey
-	c.snapGPOverlappedBytes = c.gpOverlappedBytes
-	c.snapTPtrs = append(c.snapTPtrs[:0], c.tPtrs...)
+func newDynamicContext(levels []tFiles) *compactionDynamicContext {
+	return &compactionDynamicContext{
+		tPtrs:     make([]int, len(levels)),
+		snapTPtrs: make([]int, len(levels)),
+	}
 }
 
-func (c *compaction) restore() {
-	c.gpi = c.snapGPI
-	c.seenKey = c.snapSeenKey
-	c.gpOverlappedBytes = c.snapGPOverlappedBytes
-	c.tPtrs = append(c.tPtrs[:0], c.snapTPtrs...)
+func (context *compactionDynamicContext) save() {
+	context.snapGPI = context.gpi
+	context.snapSeenKey = context.seenKey
+	context.snapGPOverlappedBytes = context.gpOverlappedBytes
+	context.snapTPtrs = append(context.snapTPtrs[:0], context.tPtrs...)
+}
+
+func (context *compactionDynamicContext) restore() {
+	context.gpi = context.snapGPI
+	context.seenKey = context.snapSeenKey
+	context.gpOverlappedBytes = context.snapGPOverlappedBytes
+	context.tPtrs = append(context.tPtrs[:0], context.snapTPtrs...)
+}
+
+// baseLevelForKey reports whether the given user-key is already in the
+// bottom-most level. Also this function will update the internal state
+// for speeding up the overall performance.
+// The assumption is held here the given user-keys are monotonic increasing.
+func (context *compactionDynamicContext) baseLevelForKey(sourceLevel int, levels []tFiles, icmp *iComparer, ukey []byte) bool {
+	for level := sourceLevel + 2; level < len(levels); level++ {
+		tables := levels[level]
+		for context.tPtrs[level] < len(tables) {
+			t := tables[context.tPtrs[level]]
+			if icmp.uCompare(ukey, t.imax.ukey()) <= 0 {
+				// We've advanced far enough.
+				if icmp.uCompare(ukey, t.imin.ukey()) >= 0 {
+					// Key falls in this file's range, so definitely not base level.
+					return false
+				}
+				break
+			}
+			context.tPtrs[level]++
+		}
+	}
+	return true
+}
+
+// shouldStopBefore reports whether the overlap between the current table
+// with the parent level is large enough. If so the table rotation is expected.
+// Also this function will update the internal state for speeding up the
+// overal performance.
+func (context *compactionDynamicContext) shouldStopBefore(gp tFiles, icmp *iComparer, maxGPOverlaps int64, ikey internalKey) bool {
+	for ; context.gpi < len(gp); context.gpi++ {
+		gp := gp[context.gpi]
+		if icmp.Compare(ikey, gp.imax) <= 0 {
+			break
+		}
+		if context.seenKey {
+			context.gpOverlappedBytes += gp.size
+		}
+	}
+	context.seenKey = true
+
+	if context.gpOverlappedBytes > maxGPOverlaps {
+		// Too much overlap for current output; start new output.
+		context.gpOverlappedBytes = 0
+		return true
+	}
+	return false
+}
+
+// compaction represent a compaction state. It's immutable(except
+// the released field), so it's totally safe to share it with multiple
+// sub-compaction threads.
+type compaction struct {
+	s             *session
+	v             *version
+	id            int64
+	typ           int
+	sourceLevel   int
+	levels        [2]tFiles
+	maxGPOverlaps int64
+	gp            tFiles
+	imin, imax    internalKey
+	released      bool
 }
 
 func (c *compaction) release() {
@@ -440,45 +487,6 @@ func (c *compaction) expand(ctx *compactionContext) bool {
 // Check whether compaction is trivial.
 func (c *compaction) trivial() bool {
 	return len(c.levels[0]) == 1 && len(c.levels[1]) == 0 && c.gp.size() <= c.maxGPOverlaps
-}
-
-func (c *compaction) baseLevelForKey(ukey []byte) bool {
-	for level := c.sourceLevel + 2; level < len(c.v.levels); level++ {
-		tables := c.v.levels[level]
-		for c.tPtrs[level] < len(tables) {
-			t := tables[c.tPtrs[level]]
-			if c.s.icmp.uCompare(ukey, t.imax.ukey()) <= 0 {
-				// We've advanced far enough.
-				if c.s.icmp.uCompare(ukey, t.imin.ukey()) >= 0 {
-					// Key falls in this file's range, so definitely not base level.
-					return false
-				}
-				break
-			}
-			c.tPtrs[level]++
-		}
-	}
-	return true
-}
-
-func (c *compaction) shouldStopBefore(ikey internalKey) bool {
-	for ; c.gpi < len(c.gp); c.gpi++ {
-		gp := c.gp[c.gpi]
-		if c.s.icmp.Compare(ikey, gp.imax) <= 0 {
-			break
-		}
-		if c.seenKey {
-			c.gpOverlappedBytes += gp.size
-		}
-	}
-	c.seenKey = true
-
-	if c.gpOverlappedBytes > c.maxGPOverlaps {
-		// Too much overlap for current output; start new output.
-		c.gpOverlappedBytes = 0
-		return true
-	}
-	return false
 }
 
 // Creates an iterator.

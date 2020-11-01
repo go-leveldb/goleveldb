@@ -383,18 +383,19 @@ func (db *DB) memCompaction() {
 }
 
 type tableCompactionBuilder struct {
-	db           *DB
-	s            *session
-	c            *compaction
-	rec          *sessionRecord
-	stat0, stat1 *cStatStaging
+	db    *DB
+	s     *session
+	c     *compaction
+	rec   *sessionRecord // For tracking all created tables
+	stat1 *cStatStaging  // For tracking all written file size and compaction time.
 
-	snapHasLastUkey bool
-	snapLastUkey    []byte
-	snapLastSeq     uint64
-	snapIter        int
-	snapKerrCnt     int
-	snapDropCnt     int
+	compactionContext *compactionDynamicContext
+	snapHasLastUkey   bool
+	snapLastUkey      []byte
+	snapLastSeq       uint64
+	snapIter          int
+	snapKerrCnt       int
+	snapDropCnt       int
 
 	kerrCnt int
 	dropCnt int
@@ -402,6 +403,14 @@ type tableCompactionBuilder struct {
 	minSeq    uint64
 	strict    bool
 	tableSize int
+
+	// Compaction range. Only useful for level0 compaction.
+	// For the level0 compaction, a big compaction can be separated
+	// into several small one. While the input(source level files) is
+	// still shared because the level0 files are overlapped. So in this
+	// case the source input has to be restricted by the given range.
+	rangeStart []byte
+	rangeLimit []byte
 
 	tw *tWriter
 }
@@ -465,7 +474,7 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) error {
 	b.kerrCnt = b.snapKerrCnt
 	b.dropCnt = b.snapDropCnt
 	// Restore compaction state.
-	b.c.restore()
+	b.compactionContext.restore()
 
 	defer b.cleanup()
 
@@ -493,7 +502,7 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) error {
 		ukey, seq, kt, kerr := parseInternalKey(ikey)
 
 		if kerr == nil {
-			shouldStop := !resumed && b.c.shouldStopBefore(ikey)
+			shouldStop := !resumed && b.compactionContext.shouldStopBefore(b.c.gp, b.c.s.icmp, b.c.maxGPOverlaps, ikey)
 
 			if !hasLastUkey || b.s.icmp.uCompare(lastUkey, ukey) != 0 {
 				// First occurrence of this user key.
@@ -505,7 +514,7 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) error {
 					}
 
 					// Creates snapshot of the state.
-					b.c.save()
+					b.compactionContext.save()
 					b.snapHasLastUkey = hasLastUkey
 					b.snapLastUkey = append(b.snapLastUkey[:0], lastUkey...)
 					b.snapLastSeq = lastSeq
@@ -523,7 +532,7 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) error {
 			case lastSeq <= b.minSeq:
 				// Dropped because newer entry for same user key exist
 				fallthrough // (A)
-			case kt == keyTypeDel && seq <= b.minSeq && b.c.baseLevelForKey(lastUkey):
+			case kt == keyTypeDel && seq <= b.minSeq && b.compactionContext.baseLevelForKey(b.c.sourceLevel, b.c.v.levels, b.c.s.icmp, lastUkey):
 				// For this user key:
 				// (1) there is no data in higher levels
 				// (2) data in lower levels will have larger seq numbers
@@ -595,8 +604,8 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 		return
 	}
 	// If it's level0 compaction
-	// - create a list of "SUB STAT" for recording output size and running time
-	// - create a list of "SUB RECORD" for recording output fds
+	// - create a list of "SUB STAT" for recording output/written size and running time
+	// - create a list of "SUB RECORD" for recording output(creation) fds
 	// - calculate the concurrency
 	//   * level-source + level-parent total size,
 	//   	e.g. more than 12MB, one more concurrency
@@ -611,6 +620,9 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 	//      interval: [x3, ffff]
 	//
 	// - schedule all compaction builders
+	//   - create a bunch of compaction builders
+	//   - create a wait group
+	//   - how to handle exit? panic?
 	//
 	// - merge all "SUB STAT"
 	// - merge all "SUB RECORD"
@@ -629,14 +641,15 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 	db.logf("table@compaction L%d·%d -> L%d·%d S·%s Q·%d", c.sourceLevel, len(c.levels[0]), c.sourceLevel+1, len(c.levels[1]), shortenb(sourceSize), minSeq)
 
 	b := &tableCompactionBuilder{
-		db:        db,
-		s:         db.s,
-		c:         c,
-		rec:       rec,
-		stat1:     &stats[1],
-		minSeq:    minSeq,
-		strict:    db.s.o.GetStrict(opt.StrictCompaction),
-		tableSize: db.s.o.GetCompactionTableSize(c.sourceLevel + 1),
+		db:                db,
+		s:                 db.s,
+		c:                 c,
+		rec:               rec,
+		stat1:             &stats[1],
+		compactionContext: newDynamicContext(c.v.levels),
+		minSeq:            minSeq,
+		strict:            db.s.o.GetStrict(opt.StrictCompaction),
+		tableSize:         db.s.o.GetCompactionTableSize(c.sourceLevel + 1),
 	}
 	db.compactionTransact("table@build", b)
 
