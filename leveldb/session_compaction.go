@@ -502,7 +502,7 @@ func (c *compaction) getWeight() int {
 	if c.sourceLevel != 0 {
 		c.weight = 1
 	} else {
-		c.weight = len(c.calculateRanges(10)) // todo make interval configurable
+		c.weight = len(c.calculateRanges(20)) // todo make interval configurable
 	}
 	return c.weight
 }

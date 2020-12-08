@@ -629,7 +629,7 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 	//   as the input, but the output key range is limited in the assigned range.
 	// - merge all the stats from the sub-compactors
 	if c.sourceLevel == 0 {
-		if compRanges := c.calculateRanges(10); len(compRanges) > 1 {
+		if compRanges := c.calculateRanges(20); len(compRanges) > 1 {
 			var (
 				wg         sync.WaitGroup
 				subStats   = make([]cStatStaging, len(compRanges))
