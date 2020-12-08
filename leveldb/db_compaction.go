@@ -473,15 +473,15 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) error {
 	lastSeq := b.snapLastSeq
 	b.kerrCnt = b.snapKerrCnt
 	b.dropCnt = b.snapDropCnt
+
 	// Restore compaction state.
 	b.compactionContext.restore()
-
 	defer b.cleanup()
 
 	b.stat1.startTimer()
 	defer b.stat1.stopTimer()
 
-	iter := b.c.newIterator()
+	iter := b.c.newIterator(b.rangeStart, b.rangeLimit)
 	defer iter.Release()
 	for i := 0; iter.Next(); i++ {
 		// Incr transact counter.
@@ -531,6 +531,8 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) error {
 			switch {
 			case lastSeq <= b.minSeq:
 				// Dropped because newer entry for same user key exist
+				// Also the last tracked entry has a smaller seq than
+				// the minimal snapshotted seq, so dropping is safe.
 				fallthrough // (A)
 			case kt == keyTypeDel && seq <= b.minSeq && b.compactionContext.baseLevelForKey(b.c.sourceLevel, b.c.v.levels, b.c.s.icmp, lastUkey):
 				// For this user key:
@@ -603,31 +605,6 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 		db.compactionCommit("table-move", rec)
 		return
 	}
-	// If it's level0 compaction
-	// - create a list of "SUB STAT" for recording output/written size and running time
-	// - create a list of "SUB RECORD" for recording output(creation) fds
-	// - calculate the concurrency
-	//   * level-source + level-parent total size,
-	//   	e.g. more than 12MB, one more concurrency
-	//           limited by the CPU.number
-	//           user can customize the compaction weight calculation
-	// - calculate the compaction interval
-	//      e.g. the concurrency is 4, split the level-parent files
-	//           to 4 group
-	//      interval: [0000, x1-1]
-	//      interval: [x1, x2-1]
-	//      interval: [x2, x3-1]
-	//      interval: [x3, ffff]
-	//
-	// - schedule all compaction builders
-	//   - create a bunch of compaction builders
-	//   - create a wait group
-	//   - how to handle exit? panic?
-	//
-	// - merge all "SUB STAT"
-	// - merge all "SUB RECORD"
-	// - commit
-
 	var stats [2]cStatStaging
 	for i, tables := range c.levels {
 		for _, t := range tables {
@@ -639,6 +616,89 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 	sourceSize := int(stats[0].read + stats[1].read)
 	minSeq := db.minSeq()
 	db.logf("table@compaction L%d·%d -> L%d·%d S·%s Q·%d", c.sourceLevel, len(c.levels[0]), c.sourceLevel+1, len(c.levels[1]), shortenb(sourceSize), minSeq)
+
+	// For the level0 compaction, try to run it in the concurrent way.
+	// The idea is quite straightforward:
+	// - split the level1 into several groups by key range, for example:
+	//   - there are 16 sstables in the level1, all of them are not
+	//     overlapped with each other.
+	//   - split them with the interval as 5 => [[0-4], [5-9], [10-14], [15]]
+	//   - the maximum group number is capped with the MAX_THREAD_NUMBER
+	// - calculate the relevant key ranges of these group => [[000, k1], [k1, k3], [k4, k5], [k6, fff]]
+	// - schedule n sub-compactors, use the entire level0 + level1's group
+	//   as the input, but the output key range is limited in the assigned range.
+	// - merge all the stats from the sub-compactors
+	if c.sourceLevel == 0 {
+		if compRanges := c.calculateRanges(10); len(compRanges) > 1 {
+			var (
+				wg         sync.WaitGroup
+				subStats   = make([]cStatStaging, len(compRanges))
+				subRecords = make([]sessionRecord, len(compRanges))
+
+				kerrCnt int32
+				dropCnt int32
+			)
+			for i := 0; i < len(compRanges); i++ {
+				wg.Add(1)
+				go func(index int) {
+					defer wg.Done()
+
+					// todo handle panic
+					b := &tableCompactionBuilder{
+						db:                db,
+						s:                 db.s,
+						c:                 c,
+						rec:               &subRecords[index],
+						stat1:             &subStats[index],
+						compactionContext: newDynamicContext(c.v.levels),
+						minSeq:            minSeq,
+						strict:            db.s.o.GetStrict(opt.StrictCompaction),
+						tableSize:         db.s.o.GetCompactionTableSize(c.sourceLevel + 1),
+						rangeStart:        compRanges[index].Start,
+						rangeLimit:        compRanges[index].Limit,
+					}
+					db.compactionTransact("table@build", b)
+
+					atomic.AddInt32(&kerrCnt, int32(b.kerrCnt))
+					atomic.AddInt32(&dropCnt, int32(b.dropCnt))
+				}(i)
+			}
+			wg.Wait()
+
+			// Merge all the change logs, note in the compaction only the
+			// added sstables are changed, only no need for other statistic
+			for i := 0; i < len(subRecords); i++ {
+				rec.addedTables = append(rec.addedTables, subRecords[i].addedTables...)
+			}
+
+			// Commit.
+			stats[1].startTimer()
+			db.compactionCommit("table", rec)
+			stats[1].stopTimer()
+
+			// Merge all the sub-statistic, mainly for the runtime and output size
+			for i := 0; i < len(subStats); i++ {
+				stats[1].duration += subStats[i].duration
+				stats[1].write += subStats[1].write
+			}
+			resultSize := int(stats[1].write)
+			db.logf("table@compaction committed F%s S%s Ke·%d D·%d T·%v", sint(len(rec.addedTables)-len(rec.deletedTables)), sshortenb(resultSize-sourceSize), kerrCnt, dropCnt, stats[1].duration)
+
+			// Save compaction stats
+			for i := range stats {
+				db.compStats.addStat(c.sourceLevel+1, &stats[i])
+			}
+			switch c.typ {
+			case level0Compaction:
+				atomic.AddUint32(&db.level0Comp, 1)
+			case nonLevel0Compaction:
+				atomic.AddUint32(&db.nonLevel0Comp, 1)
+			case seekCompaction:
+				atomic.AddUint32(&db.seekComp, 1)
+			}
+			return
+		}
+	}
 
 	b := &tableCompactionBuilder{
 		db:                db,
@@ -1069,11 +1129,10 @@ func (ctx *compactionContext) recreating(level int) tFiles {
 // suspension. So this loop will try to maximize the compaction performance by
 // selecting isolated files to compact concurrently.
 //
-// For level0 compaction, concurrency is not allowed. Since we can't guarantee two
-// level0 compactions are non-overlapped. But we do see that level0 compaction in
-// some sense become the bottleneck, it can slow down/suspend write operations if
-// it's not fast enough. Also if level0 compaction can't generate tables fast
-// enough, the non-level0 compactors may become idle.
+// For level0 compaction, it will be divided into several sub-compactions and these
+// sub-compactions can be run concurrently. The compaction efficiency of level0 is
+// the key to the write performance of the entire database. Usually, the big level0
+// compaction is the slowest part.
 //
 // For non-level0 compaction, concurrency is allowed if two compactions are totally
 // isolated.

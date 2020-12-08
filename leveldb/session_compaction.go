@@ -12,6 +12,7 @@ import (
 	"github.com/go-leveldb/goleveldb/leveldb/iterator"
 	"github.com/go-leveldb/goleveldb/leveldb/memdb"
 	"github.com/go-leveldb/goleveldb/leveldb/opt"
+	"github.com/go-leveldb/goleveldb/leveldb/util"
 )
 
 const (
@@ -317,29 +318,29 @@ func newDynamicContext(levels []tFiles) *compactionDynamicContext {
 	}
 }
 
-func (context *compactionDynamicContext) save() {
-	context.snapGPI = context.gpi
-	context.snapSeenKey = context.seenKey
-	context.snapGPOverlappedBytes = context.gpOverlappedBytes
-	context.snapTPtrs = append(context.snapTPtrs[:0], context.tPtrs...)
+func (ctx *compactionDynamicContext) save() {
+	ctx.snapGPI = ctx.gpi
+	ctx.snapSeenKey = ctx.seenKey
+	ctx.snapGPOverlappedBytes = ctx.gpOverlappedBytes
+	ctx.snapTPtrs = append(ctx.snapTPtrs[:0], ctx.tPtrs...)
 }
 
-func (context *compactionDynamicContext) restore() {
-	context.gpi = context.snapGPI
-	context.seenKey = context.snapSeenKey
-	context.gpOverlappedBytes = context.snapGPOverlappedBytes
-	context.tPtrs = append(context.tPtrs[:0], context.snapTPtrs...)
+func (ctx *compactionDynamicContext) restore() {
+	ctx.gpi = ctx.snapGPI
+	ctx.seenKey = ctx.snapSeenKey
+	ctx.gpOverlappedBytes = ctx.snapGPOverlappedBytes
+	ctx.tPtrs = append(ctx.tPtrs[:0], ctx.snapTPtrs...)
 }
 
 // baseLevelForKey reports whether the given user-key is already in the
 // bottom-most level. Also this function will update the internal state
 // for speeding up the overall performance.
 // The assumption is held here the given user-keys are monotonic increasing.
-func (context *compactionDynamicContext) baseLevelForKey(sourceLevel int, levels []tFiles, icmp *iComparer, ukey []byte) bool {
+func (ctx *compactionDynamicContext) baseLevelForKey(sourceLevel int, levels []tFiles, icmp *iComparer, ukey []byte) bool {
 	for level := sourceLevel + 2; level < len(levels); level++ {
 		tables := levels[level]
-		for context.tPtrs[level] < len(tables) {
-			t := tables[context.tPtrs[level]]
+		for ctx.tPtrs[level] < len(tables) {
+			t := tables[ctx.tPtrs[level]]
 			if icmp.uCompare(ukey, t.imax.ukey()) <= 0 {
 				// We've advanced far enough.
 				if icmp.uCompare(ukey, t.imin.ukey()) >= 0 {
@@ -348,7 +349,7 @@ func (context *compactionDynamicContext) baseLevelForKey(sourceLevel int, levels
 				}
 				break
 			}
-			context.tPtrs[level]++
+			ctx.tPtrs[level]++
 		}
 	}
 	return true
@@ -358,21 +359,21 @@ func (context *compactionDynamicContext) baseLevelForKey(sourceLevel int, levels
 // with the parent level is large enough. If so the table rotation is expected.
 // Also this function will update the internal state for speeding up the
 // overal performance.
-func (context *compactionDynamicContext) shouldStopBefore(gp tFiles, icmp *iComparer, maxGPOverlaps int64, ikey internalKey) bool {
-	for ; context.gpi < len(gp); context.gpi++ {
-		gp := gp[context.gpi]
+func (ctx *compactionDynamicContext) shouldStopBefore(gp tFiles, icmp *iComparer, maxGPOverlaps int64, ikey internalKey) bool {
+	for ; ctx.gpi < len(gp); ctx.gpi++ {
+		gp := gp[ctx.gpi]
 		if icmp.Compare(ikey, gp.imax) <= 0 {
 			break
 		}
-		if context.seenKey {
-			context.gpOverlappedBytes += gp.size
+		if ctx.seenKey {
+			ctx.gpOverlappedBytes += gp.size
 		}
 	}
-	context.seenKey = true
+	ctx.seenKey = true
 
-	if context.gpOverlappedBytes > maxGPOverlaps {
+	if ctx.gpOverlappedBytes > maxGPOverlaps {
 		// Too much overlap for current output; start new output.
-		context.gpOverlappedBytes = 0
+		ctx.gpOverlappedBytes = 0
 		return true
 	}
 	return false
@@ -489,8 +490,61 @@ func (c *compaction) trivial() bool {
 	return len(c.levels[0]) == 1 && len(c.levels[1]) == 0 && c.gp.size() <= c.maxGPOverlaps
 }
 
+// calculateRanges returns a batch of key ranges of the parent level
+// based on the required interval number. The algorithm for calculating
+// the ranges is quite simple:
+// - divide the parent level into the required groups
+// - calculate the range of each group
+//   - if it's the first group, the start is nil
+//   - if it's the last group, the limit is nil
+//   - for each non-first group, the start is the separator of the last entry
+//     in the last group and the first entry in the current group, start is
+//     included by default.
+//   - for each non-last group, the limit is the separator of the last entry
+//     in the current group and the first entry in the next group, limit is
+//     excluded by default.
+func (c *compaction) calculateRanges(interval int) []*util.Range {
+	// Short circuit if there are not enough sstables in the parent level.
+	if len(c.levels[1]) <= interval {
+		return []*util.Range{{
+			Start: nil,
+			Limit: nil,
+		}}
+	}
+	var (
+		ranges []*util.Range
+		groups = (len(c.levels[1])-1)/interval + 1
+	)
+	for i := 0; i < groups; i++ {
+		compRange := &util.Range{}
+
+		// For the first group, the start is nil; for all non-first
+		// group, the start is separator of the last entry in the last
+		// group and the first entry in the current group
+		if i != 0 {
+			separator := c.s.icmp.Separator(nil, c.levels[1][i*interval-1].imax, c.levels[1][i*interval].imin)
+			if separator == nil {
+				separator = c.levels[1][i*interval].imin
+			}
+			compRange.Start = separator
+		}
+		// For the last group, the limit is nil; for all non-last
+		// group, the limit is the separator of the last entry in
+		// the current group and the first entry in the next group
+		if i != (groups - 1) {
+			separator := c.s.icmp.Separator(nil, c.levels[1][(i+1)*interval-1].imax, c.levels[1][(i+1)*interval].imin)
+			if separator == nil {
+				separator = c.levels[1][(i+1)*interval].imin
+			}
+			compRange.Limit = separator
+		}
+		ranges = append(ranges, compRange)
+	}
+	return ranges
+}
+
 // Creates an iterator.
-func (c *compaction) newIterator() iterator.Iterator {
+func (c *compaction) newIterator(start, limit []byte) iterator.Iterator {
 	// Creates iterator slice.
 	icap := len(c.levels)
 	if c.sourceLevel == 0 {
@@ -500,6 +554,8 @@ func (c *compaction) newIterator() iterator.Iterator {
 	its := make([]iterator.Iterator, 0, icap)
 
 	// Options.
+
+	// TODO the index block can't be shared by sub-compactors
 	ro := &opt.ReadOptions{
 		DontFillCache: true,
 		Strict:        opt.StrictOverride,
@@ -517,10 +573,16 @@ func (c *compaction) newIterator() iterator.Iterator {
 		// Level-0 is not sorted and may overlaps each other.
 		if c.sourceLevel+i == 0 {
 			for _, t := range tables {
-				its = append(its, c.s.tops.newIterator(t, nil, ro))
+				its = append(its, c.s.tops.newIterator(t, &util.Range{
+					Start: start,
+					Limit: limit,
+				}, ro))
 			}
 		} else {
-			it := iterator.NewIndexedIterator(tables.newIndexIterator(c.s.tops, c.s.icmp, nil, ro), strict)
+			it := iterator.NewIndexedIterator(tables.newIndexIterator(c.s.tops, c.s.icmp, &util.Range{
+				Start: start,
+				Limit: limit,
+			}, ro), strict)
 			its = append(its, it)
 		}
 	}
