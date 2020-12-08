@@ -1027,15 +1027,13 @@ func (x *compactionsSortByKey) Less(i, j int) bool {
 	return x.lessByKey(x.icmp, i, j)
 }
 
-// TODO @rjl493456442 compaction has weight. E.g.
-// The level0 compaction has higher weight if it's "concurrent-able".
-// The non-level0 compaction has the default 1 weight.
 type compactionContext struct {
-	sorted   map[int][]*compaction
-	fifo     map[int][]*compaction
-	icmp     *iComparer
-	noseek   bool
-	denylist map[int]struct{}
+	sorted      map[int][]*compaction
+	fifo        map[int][]*compaction
+	icmp        *iComparer
+	noseek      bool
+	totalWeight int
+	denylist    map[int]struct{}
 }
 
 func (ctx *compactionContext) add(c *compaction) {
@@ -1045,6 +1043,7 @@ func (ctx *compactionContext) add(c *compaction) {
 		icmp:        ctx.icmp,
 	})
 	ctx.fifo[c.sourceLevel] = append(ctx.fifo[c.sourceLevel], c)
+	ctx.totalWeight += c.getWeight()
 }
 
 func (ctx *compactionContext) delete(c *compaction) {
@@ -1061,6 +1060,7 @@ func (ctx *compactionContext) delete(c *compaction) {
 		}
 	}
 	ctx.reset(c.sourceLevel)
+	ctx.totalWeight -= c.getWeight()
 	return
 }
 
@@ -1083,11 +1083,7 @@ func (ctx *compactionContext) reset(level int) {
 }
 
 func (ctx *compactionContext) count() int {
-	var total int
-	for _, comps := range ctx.sorted {
-		total += len(comps)
-	}
-	return total
+	return ctx.totalWeight
 }
 
 func (ctx *compactionContext) get(level int) []*compaction {

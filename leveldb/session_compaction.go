@@ -393,6 +393,7 @@ type compaction struct {
 	gp            tFiles
 	imin, imax    internalKey
 	released      bool
+	weight        int
 }
 
 func (c *compaction) release() {
@@ -488,6 +489,22 @@ func (c *compaction) expand(ctx *compactionContext) bool {
 // Check whether compaction is trivial.
 func (c *compaction) trivial() bool {
 	return len(c.levels[0]) == 1 && len(c.levels[1]) == 0 && c.gp.size() <= c.maxGPOverlaps
+}
+
+// getWeight returns the weight of compaction. It's used in the concurrent compaction limiter.
+// The weight of non-level0 compaction is 1 by default seems they won't be divided into
+// smaller sub-compaction. The weight of level0 compaction is determined by the compaction
+// size.
+func (c *compaction) getWeight() int {
+	if c.weight != 0 {
+		return c.weight
+	}
+	if c.sourceLevel != 0 {
+		c.weight = 1
+	} else {
+		c.weight = len(c.calculateRanges(10)) // todo make interval configurable
+	}
+	return c.weight
 }
 
 // calculateRanges returns a batch of key ranges of the parent level
