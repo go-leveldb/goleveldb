@@ -495,16 +495,73 @@ func (c *compaction) trivial() bool {
 // The weight of non-level0 compaction is 1 by default seems they won't be divided into
 // smaller sub-compaction. The weight of level0 compaction is determined by the compaction
 // size.
-func (c *compaction) getWeight() int {
+func (c *compaction) getWeight(maxConcurrency int, minLevel0SubCompactionSize int) int {
 	if c.weight != 0 {
 		return c.weight
 	}
 	if c.sourceLevel != 0 {
 		c.weight = 1
 	} else {
-		c.weight = len(c.calculateRanges(20)) // todo make interval configurable
+		c.weight = len(c.calculateRanges(maxConcurrency, minLevel0SubCompactionSize)) // todo make interval configurable
 	}
 	return c.weight
+}
+
+// calculateRanges returns a batch of key ranges of the parent level
+// based on the given max concurrency. The algorithm for calculating
+// the ranges is quite simple:
+// - divide the parent level into the suitable groups
+// - calculate the range of each group
+//   - if it's the first group, the start is nil
+//   - if it's the last group, the limit is nil
+//   - for each non-first group, the start is the separator of the last entry
+//     in the last group and the first entry in the current group, start is
+//     included by default.
+//   - for each non-last group, the limit is the separator of the last entry
+//     in the current group and the first entry in the next group, limit is
+//     excluded by default.
+func (c *compaction) calculateRanges(maxConcurrency int, minGroupSize int) []*util.Range {
+	// Short circuit if there are not enough sstables in the parent level.
+	if len(c.levels[1]) <= minGroupSize {
+		return []*util.Range{{
+			Start: nil,
+			Limit: nil,
+		}}
+	}
+	groupSize := minGroupSize
+	if maxConcurrency*minGroupSize < len(c.levels[1]) {
+		groupSize = (len(c.levels[1])-1)/maxConcurrency + 1
+	}
+	var (
+		ranges []*util.Range
+		groups = (len(c.levels[1])-1)/groupSize + 1
+	)
+	for i := 0; i < groups; i++ {
+		compRange := &util.Range{}
+
+		// For the first group, the start is nil; for all non-first
+		// group, the start is separator of the last entry in the last
+		// group and the first entry in the current group
+		if i != 0 {
+			separator := c.s.icmp.Separator(nil, c.levels[1][i*groupSize-1].imax, c.levels[1][i*groupSize].imin)
+			if separator == nil {
+				separator = c.levels[1][i*groupSize].imin
+			}
+			compRange.Start = separator
+		}
+		// For the last group, the limit is nil; for all non-last
+		// group, the limit is the separator of the last entry in
+		// the current group and the first entry in the next group
+		if i != (groups - 1) {
+			separator := c.s.icmp.Separator(nil, c.levels[1][(i+1)*groupSize-1].imax, c.levels[1][(i+1)*groupSize].imin)
+			if separator == nil {
+				separator = c.levels[1][(i+1)*groupSize].imin
+			}
+			compRange.Limit = separator
+		}
+		ranges = append(ranges, compRange)
+	}
+	return ranges
 }
 
 // calculateRanges returns a batch of key ranges of the parent level
@@ -520,7 +577,7 @@ func (c *compaction) getWeight() int {
 //   - for each non-last group, the limit is the separator of the last entry
 //     in the current group and the first entry in the next group, limit is
 //     excluded by default.
-func (c *compaction) calculateRanges(interval int) []*util.Range {
+func (c *compaction) calculateRanges2(interval int) []*util.Range {
 	// Short circuit if there are not enough sstables in the parent level.
 	if len(c.levels[1]) <= interval {
 		return []*util.Range{{

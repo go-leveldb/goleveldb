@@ -586,7 +586,7 @@ func (b *tableCompactionBuilder) revert() error {
 	return nil
 }
 
-func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compaction)) {
+func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compaction), maxConcurrency int) {
 	defer c.release()
 	defer func() {
 		if done != nil {
@@ -629,7 +629,7 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 	//   as the input, but the output key range is limited in the assigned range.
 	// - merge all the stats from the sub-compactors
 	if c.sourceLevel == 0 {
-		if compRanges := c.calculateRanges(20); len(compRanges) > 1 {
+		if compRanges := c.calculateRanges(maxConcurrency, 5); len(compRanges) > 1 {
 			var (
 				wg         sync.WaitGroup
 				subStats   = make([]cStatStaging, len(compRanges))
@@ -816,7 +816,7 @@ func (db *DB) tableRangeCompactionAt(level int, umin, umax []byte) error {
 					case done <- c:
 					case <-db.closeC:
 					}
-				})
+				}, compLimit)
 			}()
 		} else {
 			// All overlapped tables have been merged to the parent level
@@ -1043,7 +1043,7 @@ func (ctx *compactionContext) add(c *compaction) {
 		icmp:        ctx.icmp,
 	})
 	ctx.fifo[c.sourceLevel] = append(ctx.fifo[c.sourceLevel], c)
-	ctx.totalWeight += c.getWeight()
+	ctx.totalWeight += c.getWeight(0, 0)
 }
 
 func (ctx *compactionContext) delete(c *compaction) {
@@ -1060,7 +1060,7 @@ func (ctx *compactionContext) delete(c *compaction) {
 		}
 	}
 	ctx.reset(c.sourceLevel)
-	ctx.totalWeight -= c.getWeight()
+	ctx.totalWeight -= c.getWeight(0, 0)
 	return
 }
 
@@ -1281,11 +1281,11 @@ func (db *DB) tCompaction() {
 			x = nil
 			continue
 		}
-		db.runCompaction(ctx, level, table, &subWg, done)
+		db.runCompaction(ctx, level, table, &subWg, done, compLimit)
 	}
 }
 
-func (db *DB) runCompaction(ctx *compactionContext, level int, table *tFile, wg *sync.WaitGroup, done chan *compaction) {
+func (db *DB) runCompaction(ctx *compactionContext, level int, table *tFile, wg *sync.WaitGroup, done chan *compaction, maxConcurrency int) {
 	var c *compaction
 	if table == nil {
 		c = db.s.pickCompactionByLevel(level, ctx)
@@ -1324,6 +1324,6 @@ func (db *DB) runCompaction(ctx *compactionContext, level int, table *tFile, wg 
 			case done <- c:
 			case <-db.closeC:
 			}
-		})
+		}, maxConcurrency)
 	}()
 }
