@@ -690,6 +690,7 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 			}
 			switch c.typ {
 			case level0Compaction:
+				atomic.AddUint32(&db.level0SubComp, uint32(len(compRanges)))
 				atomic.AddUint32(&db.level0Comp, 1)
 			case nonLevel0Compaction:
 				atomic.AddUint32(&db.nonLevel0Comp, 1)
@@ -727,6 +728,7 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 	}
 	switch c.typ {
 	case level0Compaction:
+		atomic.AddUint32(&db.level0SubComp, 1)
 		atomic.AddUint32(&db.level0Comp, 1)
 	case nonLevel0Compaction:
 		atomic.AddUint32(&db.nonLevel0Comp, 1)
