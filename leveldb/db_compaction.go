@@ -768,12 +768,7 @@ func (db *DB) tableRangeCompactionAt(level int, umin, umax []byte) error {
 		compLimit = db.s.o.GetCompactionConcurrency()
 
 		// Compaction context includes all ongoing compactions.
-		ctx = &compactionContext{
-			sorted:   make(map[int][]*compaction),
-			fifo:     make(map[int][]*compaction),
-			icmp:     db.s.icmp,
-			denylist: make(map[int]struct{}),
-		}
+		ctx   = newCompactionContext(compLimit, 5, db.s.icmp)
 		done  = make(chan *compaction)
 		subWg sync.WaitGroup
 	)
@@ -1028,12 +1023,25 @@ func (x *compactionsSortByKey) Less(i, j int) bool {
 }
 
 type compactionContext struct {
-	sorted      map[int][]*compaction
-	fifo        map[int][]*compaction
-	icmp        *iComparer
-	noseek      bool
-	totalWeight int
-	denylist    map[int]struct{}
+	maxConcurrency   int
+	minLevel0SubSize int
+	sorted           map[int][]*compaction
+	fifo             map[int][]*compaction
+	icmp             *iComparer
+	noseek           bool
+	totalWeight      int
+	denylist         map[int]struct{}
+}
+
+func newCompactionContext(maxConcurrency int, minLevel0SubSize int, icmp *iComparer) *compactionContext {
+	return &compactionContext{
+		maxConcurrency:   maxConcurrency,
+		minLevel0SubSize: minLevel0SubSize,
+		sorted:           make(map[int][]*compaction),
+		fifo:             make(map[int][]*compaction),
+		icmp:             icmp,
+		denylist:         make(map[int]struct{}),
+	}
 }
 
 func (ctx *compactionContext) add(c *compaction) {
@@ -1043,7 +1051,7 @@ func (ctx *compactionContext) add(c *compaction) {
 		icmp:        ctx.icmp,
 	})
 	ctx.fifo[c.sourceLevel] = append(ctx.fifo[c.sourceLevel], c)
-	ctx.totalWeight += c.getWeight(0, 0)
+	ctx.totalWeight += c.getWeight(ctx.maxConcurrency, ctx.minLevel0SubSize)
 }
 
 func (ctx *compactionContext) delete(c *compaction) {
@@ -1060,7 +1068,7 @@ func (ctx *compactionContext) delete(c *compaction) {
 		}
 	}
 	ctx.reset(c.sourceLevel)
-	ctx.totalWeight -= c.getWeight(0, 0)
+	ctx.totalWeight -= c.getWeight(ctx.maxConcurrency, ctx.minLevel0SubSize)
 	return
 }
 
@@ -1158,12 +1166,7 @@ func (db *DB) tCompaction() {
 		compLimit = db.s.o.GetCompactionConcurrency()
 
 		// Compaction context includes all ongoing compactions.
-		ctx = &compactionContext{
-			sorted:   make(map[int][]*compaction),
-			fifo:     make(map[int][]*compaction),
-			icmp:     db.s.icmp,
-			denylist: make(map[int]struct{}),
-		}
+		ctx   = newCompactionContext(compLimit, 5, db.s.icmp)
 		done  = make(chan *compaction)
 		subWg sync.WaitGroup
 

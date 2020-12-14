@@ -502,7 +502,7 @@ func (c *compaction) getWeight(maxConcurrency int, minLevel0SubCompactionSize in
 	if c.sourceLevel != 0 {
 		c.weight = 1
 	} else {
-		c.weight = len(c.calculateRanges(maxConcurrency, minLevel0SubCompactionSize)) // todo make interval configurable
+		c.weight = len(c.calculateRanges(maxConcurrency, minLevel0SubCompactionSize))
 	}
 	return c.weight
 }
