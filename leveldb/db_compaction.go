@@ -397,9 +397,11 @@ type tableCompactionBuilder struct {
 	snapIter          int
 	snapKerrCnt       int
 	snapDropCnt       int
+	snapInputCnt      int
 
-	kerrCnt int
-	dropCnt int
+	kerrCnt  int
+	dropCnt  int
+	inputCnt int
 
 	minSeq    uint64
 	strict    bool
@@ -474,6 +476,7 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) error {
 	lastSeq := b.snapLastSeq
 	b.kerrCnt = b.snapKerrCnt
 	b.dropCnt = b.snapDropCnt
+	b.inputCnt = b.snapInputCnt
 
 	// Restore compaction state.
 	b.compactionContext.restore()
@@ -501,6 +504,7 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) error {
 
 		ikey := iter.Key()
 		ukey, seq, kt, kerr := parseInternalKey(ikey)
+		b.inputCnt += 1
 
 		if kerr == nil {
 			shouldStop := !resumed && b.compactionContext.shouldStopBefore(b.c.gp, b.c.s.icmp, b.c.maxGPOverlaps, ikey)
@@ -522,6 +526,7 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) error {
 					b.snapIter = i
 					b.snapKerrCnt = b.kerrCnt
 					b.snapDropCnt = b.dropCnt
+					b.snapInputCnt = b.inputCnt
 				}
 
 				hasLastUkey = true
@@ -636,9 +641,10 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 				subStats   = make([]cStatStaging, len(compRanges))
 				subRecords = make([]sessionRecord, len(compRanges))
 
-				kerrCnt int32
-				dropCnt int32
-				start   = time.Now()
+				kerrCnt  int32
+				dropCnt  int32
+				inputCnt int32
+				start    = time.Now()
 			)
 			for i := 0; i < len(compRanges); i++ {
 				wg.Add(1)
@@ -663,6 +669,7 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 
 					atomic.AddInt32(&kerrCnt, int32(b.kerrCnt))
 					atomic.AddInt32(&dropCnt, int32(b.dropCnt))
+					atomic.AddInt32(&inputCnt, int32(b.inputCnt))
 				}(i)
 			}
 			wg.Wait()
@@ -680,27 +687,57 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 
 			// Merge all the sub-statistic, mainly for the runtime and output size
 			var (
-				x   []float64
+				x []float64
+				r []float64
+				w []float64
+
 				min float64
 				max float64
+
+				minr float64
+				maxr float64
+
+				minw float64
+				maxw float64
 			)
 			for i := 0; i < len(subStats); i++ {
 				stats[1].duration += subStats[i].duration
 				stats[1].write += subStats[i].write
 
 				sub := float64(subStats[i].duration) / float64(time.Second)
+				subRead := float64(subStats[i].read) / float64(opt.MiB)
+				subWrite := float64(subStats[i].write) / float64(opt.MiB)
 				x = append(x, sub)
+				r = append(r, subRead)
+				w = append(w, subWrite)
+
 				if min == 0 || min > sub {
 					min = sub
 				}
 				if max == 0 || max < sub {
 					max = sub
 				}
+
+				if minr == 0 || minr > subRead {
+					minr = subRead
+				}
+				if maxr == 0 || maxr < subRead {
+					maxr = subRead
+				}
+
+				if minw == 0 || minw > subWrite {
+					minw = subWrite
+				}
+				if maxw == 0 || maxw < subWrite {
+					maxw = subWrite
+				}
 			}
-			db.logf("table@level0 compaction stddev·%.6f avg·%.2f elasped·%v min·%v max·%v items·%d data·%v", stat.StdDev(x, nil), stat.Mean(x, nil), time.Since(start), min, max, len(subStats), x)
+			db.logf("table@level0 compaction TIME stddev·%.6f avg·%.2f elasped·%v min·%v max·%v items·%d data·%v", stat.StdDev(x, nil), stat.Mean(x, nil), time.Since(start), min, max, len(subStats), x)
+			db.logf("table@level0 compaction READ stddev·%.6f avg·%.2f elasped·%v min·%v max·%v items·%d data·%v", stat.StdDev(r, nil), stat.Mean(r, nil), time.Since(start), minr, maxr, len(subStats), r)
+			db.logf("table@level0 compaction WRITE stddev·%.6f avg·%.2f elasped·%v min·%v max·%v items·%d data·%v", stat.StdDev(w, nil), stat.Mean(w, nil), time.Since(start), minw, maxw, len(subStats), w)
 
 			resultSize := int(stats[1].write)
-			db.logf("table@compaction committed F%s S%s Ke·%d D·%d T·%v", sint(len(rec.addedTables)-len(rec.deletedTables)), sshortenb(resultSize-sourceSize), kerrCnt, dropCnt, stats[1].duration)
+			db.logf("table@compaction committed F%s S%s Ke·%d D·%d I·%d T·%v", sint(len(rec.addedTables)-len(rec.deletedTables)), sshortenb(resultSize-sourceSize), kerrCnt, dropCnt, inputCnt, stats[1].duration)
 
 			// Save compaction stats
 			for i := range stats {
