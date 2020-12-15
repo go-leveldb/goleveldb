@@ -697,7 +697,7 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 					max = sub
 				}
 			}
-			db.logf("table@level0 compaction stddev·%.6f avg·%.2f elasped·%v min·%v max·%v items·%d", stat.StdDev(x, nil), stat.Mean(x, nil), time.Since(start), min, max, len(subStats))
+			db.logf("table@level0 compaction stddev·%.6f avg·%.2f elasped·%v min·%v max·%v items·%d data·%v", stat.StdDev(x, nil), stat.Mean(x, nil), time.Since(start), min, max, len(subStats), x)
 
 			resultSize := int(stats[1].write)
 			db.logf("table@compaction committed F%s S%s Ke·%d D·%d T·%v", sint(len(rec.addedTables)-len(rec.deletedTables)), sshortenb(resultSize-sourceSize), kerrCnt, dropCnt, stats[1].duration)
