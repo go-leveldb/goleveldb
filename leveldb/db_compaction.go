@@ -688,7 +688,7 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 				stats[1].duration += subStats[i].duration
 				stats[1].write += subStats[1].write
 
-				sub := float64(subStats[1].duration) / float64(time.Second)
+				sub := float64(subStats[i].duration) / float64(time.Second)
 				x = append(x, sub)
 				if min == 0 || min > sub {
 					min = sub
