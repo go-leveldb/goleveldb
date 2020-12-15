@@ -638,6 +638,7 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 
 				kerrCnt int32
 				dropCnt int32
+				start   = time.Now()
 			)
 			for i := 0; i < len(compRanges); i++ {
 				wg.Add(1)
@@ -682,9 +683,9 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 			for i := 0; i < len(subStats); i++ {
 				stats[1].duration += subStats[i].duration
 				stats[1].write += subStats[1].write
-				x = append(x, float64(stats[1].duration)/float64(time.Second))
+				x = append(x, float64(subStats[1].duration)/float64(time.Second))
 			}
-			db.logf("table@level0 compaction stddev·%.2f avg·%.2f", stat.StdDev(x, nil), stat.Mean(x, nil))
+			db.logf("table@level0 compaction stddev·%.2f avg·%.2f elasped·%v", stat.StdDev(x, nil), stat.Mean(x, nil), time.Since(start))
 
 			resultSize := int(stats[1].write)
 			db.logf("table@compaction committed F%s S%s Ke·%d D·%d T·%v", sint(len(rec.addedTables)-len(rec.deletedTables)), sshortenb(resultSize-sourceSize), kerrCnt, dropCnt, stats[1].duration)
