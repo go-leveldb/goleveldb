@@ -15,6 +15,7 @@ import (
 	"github.com/go-leveldb/goleveldb/leveldb/errors"
 	"github.com/go-leveldb/goleveldb/leveldb/opt"
 	"github.com/go-leveldb/goleveldb/leveldb/storage"
+	"github.com/gonum/stat"
 )
 
 var (
@@ -677,10 +678,14 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 			stats[1].stopTimer()
 
 			// Merge all the sub-statistic, mainly for the runtime and output size
+			var x []float64
 			for i := 0; i < len(subStats); i++ {
 				stats[1].duration += subStats[i].duration
 				stats[1].write += subStats[1].write
+				x = append(x, float64(stats[1].duration)/float64(time.Second))
 			}
+			db.logf("table@level0 compaction stddev·%.2f avg·%.2f", stat.StdDev(x, nil), stat.Mean(x, nil))
+
 			resultSize := int(stats[1].write)
 			db.logf("table@compaction committed F%s S%s Ke·%d D·%d T·%v", sint(len(rec.addedTables)-len(rec.deletedTables)), sshortenb(resultSize-sourceSize), kerrCnt, dropCnt, stats[1].duration)
 
