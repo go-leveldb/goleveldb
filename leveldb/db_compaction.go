@@ -679,13 +679,25 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 			stats[1].stopTimer()
 
 			// Merge all the sub-statistic, mainly for the runtime and output size
-			var x []float64
+			var (
+				x   []float64
+				min float64
+				max float64
+			)
 			for i := 0; i < len(subStats); i++ {
 				stats[1].duration += subStats[i].duration
 				stats[1].write += subStats[1].write
-				x = append(x, float64(subStats[1].duration)/float64(time.Second))
+
+				sub := float64(subStats[1].duration) / float64(time.Second)
+				x = append(x, sub)
+				if min == 0 || min > sub {
+					min = sub
+				}
+				if max == 0 || max < sub {
+					max = sub
+				}
 			}
-			db.logf("table@level0 compaction stddev·%.2f avg·%.2f elasped·%v", stat.StdDev(x, nil), stat.Mean(x, nil), time.Since(start))
+			db.logf("table@level0 compaction stddev·%.6f avg·%.2f elasped·%v min·%v max·%v", stat.StdDev(x, nil), stat.Mean(x, nil), time.Since(start), min, max)
 
 			resultSize := int(stats[1].write)
 			db.logf("table@compaction committed F%s S%s Ke·%d D·%d T·%v", sint(len(rec.addedTables)-len(rec.deletedTables)), sshortenb(resultSize-sourceSize), kerrCnt, dropCnt, stats[1].duration)
