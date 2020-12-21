@@ -7,6 +7,7 @@
 package leveldb
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 	"github.com/go-leveldb/goleveldb/leveldb/errors"
 	"github.com/go-leveldb/goleveldb/leveldb/opt"
 	"github.com/go-leveldb/goleveldb/leveldb/storage"
+	"github.com/gonum/stat"
 )
 
 var (
@@ -348,7 +350,6 @@ func (db *DB) memCompaction() {
 		}
 		return nil
 	})
-
 	rec.setJournalNum(db.journalFd.Num)
 	rec.setSeqNum(db.frozenSeq)
 
@@ -383,18 +384,19 @@ func (db *DB) memCompaction() {
 }
 
 type tableCompactionBuilder struct {
-	db           *DB
-	s            *session
-	c            *compaction
-	rec          *sessionRecord
-	stat0, stat1 *cStatStaging
+	db    *DB
+	s     *session
+	c     *compaction
+	rec   *sessionRecord // For tracking all created tables
+	stat1 *cStatStaging  // For tracking all written file size and compaction time.
 
-	snapHasLastUkey bool
-	snapLastUkey    []byte
-	snapLastSeq     uint64
-	snapIter        int
-	snapKerrCnt     int
-	snapDropCnt     int
+	compactionContext *compactionDynamicContext
+	snapHasLastUkey   bool
+	snapLastUkey      []byte
+	snapLastSeq       uint64
+	snapIter          int
+	snapKerrCnt       int
+	snapDropCnt       int
 
 	kerrCnt int
 	dropCnt int
@@ -402,6 +404,14 @@ type tableCompactionBuilder struct {
 	minSeq    uint64
 	strict    bool
 	tableSize int
+
+	// Compaction range. Only useful for level0 compaction.
+	// For the level0 compaction, a big compaction can be separated
+	// into several small one. While the input(source level files) is
+	// still shared because the level0 files are overlapped. So in this
+	// case the source input has to be restricted by the given range.
+	rangeStart []byte
+	rangeLimit []byte
 
 	tw *tWriter
 }
@@ -455,6 +465,8 @@ func (b *tableCompactionBuilder) cleanup() {
 	}
 }
 
+// TODO @rjl493456442 why the compaction can be rerun over and over again.
+// Sent the email probably.
 func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) error {
 	snapResumed := b.snapIter > 0
 	hasLastUkey := b.snapHasLastUkey // The key might has zero length, so this is necessary.
@@ -462,15 +474,15 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) error {
 	lastSeq := b.snapLastSeq
 	b.kerrCnt = b.snapKerrCnt
 	b.dropCnt = b.snapDropCnt
-	// Restore compaction state.
-	b.c.restore()
 
+	// Restore compaction state.
+	b.compactionContext.restore()
 	defer b.cleanup()
 
 	b.stat1.startTimer()
 	defer b.stat1.stopTimer()
 
-	iter := b.c.newIterator()
+	iter := b.c.newIterator(b.rangeStart, b.rangeLimit)
 	defer iter.Release()
 	for i := 0; iter.Next(); i++ {
 		// Incr transact counter.
@@ -491,7 +503,7 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) error {
 		ukey, seq, kt, kerr := parseInternalKey(ikey)
 
 		if kerr == nil {
-			shouldStop := !resumed && b.c.shouldStopBefore(ikey)
+			shouldStop := !resumed && b.compactionContext.shouldStopBefore(b.c.gp, b.c.s.icmp, b.c.maxGPOverlaps, ikey)
 
 			if !hasLastUkey || b.s.icmp.uCompare(lastUkey, ukey) != 0 {
 				// First occurrence of this user key.
@@ -503,7 +515,7 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) error {
 					}
 
 					// Creates snapshot of the state.
-					b.c.save()
+					b.compactionContext.save()
 					b.snapHasLastUkey = hasLastUkey
 					b.snapLastUkey = append(b.snapLastUkey[:0], lastUkey...)
 					b.snapLastSeq = lastSeq
@@ -520,8 +532,10 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) error {
 			switch {
 			case lastSeq <= b.minSeq:
 				// Dropped because newer entry for same user key exist
+				// Also the last tracked entry has a smaller seq than
+				// the minimal snapshotted seq, so dropping is safe.
 				fallthrough // (A)
-			case kt == keyTypeDel && seq <= b.minSeq && b.c.baseLevelForKey(lastUkey):
+			case kt == keyTypeDel && seq <= b.minSeq && b.compactionContext.baseLevelForKey(b.c.sourceLevel, b.c.v.levels, b.c.s.icmp, lastUkey):
 				// For this user key:
 				// (1) there is no data in higher levels
 				// (2) data in lower levels will have larger seq numbers
@@ -573,7 +587,132 @@ func (b *tableCompactionBuilder) revert() error {
 	return nil
 }
 
-func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compaction)) {
+func (db *DB) level0Compaction(c *compaction, maxConcurrency int, minLevel0SubSize int64, stats [2]cStatStaging, rec *sessionRecord) bool {
+	compRanges, err := c.calculateRanges(maxConcurrency, minLevel0SubSize)
+	if err != nil {
+		return false
+	}
+	if len(compRanges) <= 1 {
+		return false
+	}
+	var (
+		wg         sync.WaitGroup
+		subStats   = make([]cStatStaging, len(compRanges))
+		subRecords = make([]sessionRecord, len(compRanges))
+
+		kerrCnt int32
+		dropCnt int32
+		start   = time.Now()
+	)
+	for i := 0; i < len(compRanges); i++ {
+		wg.Add(1)
+		go func(index int) {
+			// Catch the panic in its own goroutine.
+			defer func() {
+				if x := recover(); x != nil {
+					if x != errCompactionTransactExiting {
+						panic(x)
+					}
+				}
+			}()
+			defer wg.Done()
+
+			b := &tableCompactionBuilder{
+				db:                db,
+				s:                 db.s,
+				c:                 c,
+				rec:               &subRecords[index],
+				stat1:             &subStats[index],
+				compactionContext: newDynamicContext(c.v.levels),
+				minSeq:            db.minSeq(),
+				strict:            db.s.o.GetStrict(opt.StrictCompaction),
+				tableSize:         db.s.o.GetCompactionTableSize(c.sourceLevel + 1),
+				rangeStart:        compRanges[index].Start,
+				rangeLimit:        compRanges[index].Limit,
+			}
+			db.compactionTransact("table@build", b)
+
+			atomic.AddInt32(&kerrCnt, int32(b.kerrCnt))
+			atomic.AddInt32(&dropCnt, int32(b.dropCnt))
+		}(i)
+	}
+	wg.Wait()
+
+	// Merge all the change logs "in order", note in the compaction only
+	// the added sstables are changed, only no need for other statistic.
+	for i := 0; i < len(subRecords); i++ {
+		rec.addedTables = append(rec.addedTables, subRecords[i].addedTables...)
+	}
+
+	// Commit.
+	stats[1].startTimer()
+	db.compactionCommit("table", rec)
+	stats[1].stopTimer()
+
+	// Merge all the sub-statistic, mainly for the runtime and output size
+	var (
+		x []float64
+		r []float64
+		w []float64
+
+		min float64
+		max float64
+
+		minr float64
+		maxr float64
+
+		minw float64
+		maxw float64
+	)
+	for i := 0; i < len(subStats); i++ {
+		stats[1].duration += subStats[i].duration
+		stats[1].write += subStats[i].write
+
+		sub := float64(subStats[i].duration) / float64(time.Second)
+		subRead := float64(subStats[i].read) / float64(opt.MiB)
+		subWrite := float64(subStats[i].write) / float64(opt.MiB)
+		x = append(x, sub)
+		r = append(r, subRead)
+		w = append(w, subWrite)
+
+		if min == 0 || min > sub {
+			min = sub
+		}
+		if max == 0 || max < sub {
+			max = sub
+		}
+
+		if minr == 0 || minr > subRead {
+			minr = subRead
+		}
+		if maxr == 0 || maxr < subRead {
+			maxr = subRead
+		}
+
+		if minw == 0 || minw > subWrite {
+			minw = subWrite
+		}
+		if maxw == 0 || maxw < subWrite {
+			maxw = subWrite
+		}
+	}
+	fmt.Printf("table@level0 compaction TIME stddev·%.6f avg·%.2f elasped·%v min·%v max·%v items·%d data·%v\n", stat.StdDev(x, nil), stat.Mean(x, nil), time.Since(start), min, max, len(subStats), x)
+	fmt.Printf("table@level0 compaction READ stddev·%.6f avg·%.2f elasped·%v min·%v max·%v items·%d data·%v\n", stat.StdDev(r, nil), stat.Mean(r, nil), time.Since(start), minr, maxr, len(subStats), r)
+	fmt.Printf("table@level0 compaction WRITE stddev·%.6f avg·%.2f elasped·%v min·%v max·%v items·%d data·%v\n", stat.StdDev(w, nil), stat.Mean(w, nil), time.Since(start), minw, maxw, len(subStats), w)
+
+	resultSize := stats[1].write
+	db.logf("table@compaction committed F%s S%s Ke·%d D·%d T·%v", sint(len(rec.addedTables)-len(rec.deletedTables)), sshortenb(int(resultSize-stats[0].read-stats[0].read)), kerrCnt, dropCnt, stats[1].duration)
+
+	// Save compaction stats
+	for i := range stats {
+		db.compStats.addStat(c.sourceLevel+1, &stats[i])
+	}
+	atomic.AddUint32(&db.level0SubComp, uint32(len(compRanges)))
+	atomic.AddUint32(&db.level0Comp, 1)
+	return true
+}
+
+func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compaction), maxConcurrency int, minLevel0SubSize int64) {
 	defer c.release()
 	defer func() {
 		if done != nil {
@@ -592,7 +731,6 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 		db.compactionCommit("table-move", rec)
 		return
 	}
-
 	var stats [2]cStatStaging
 	for i, tables := range c.levels {
 		for _, t := range tables {
@@ -605,15 +743,20 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 	minSeq := db.minSeq()
 	db.logf("table@compaction L%d·%d -> L%d·%d S·%s Q·%d", c.sourceLevel, len(c.levels[0]), c.sourceLevel+1, len(c.levels[1]), shortenb(sourceSize), minSeq)
 
+	// For the level0 compaction, try to run it in the concurrent way.
+	if c.sourceLevel == 0 && db.level0Compaction(c, maxConcurrency, minLevel0SubSize, stats, rec) {
+		return
+	}
 	b := &tableCompactionBuilder{
-		db:        db,
-		s:         db.s,
-		c:         c,
-		rec:       rec,
-		stat1:     &stats[1],
-		minSeq:    minSeq,
-		strict:    db.s.o.GetStrict(opt.StrictCompaction),
-		tableSize: db.s.o.GetCompactionTableSize(c.sourceLevel + 1),
+		db:                db,
+		s:                 db.s,
+		c:                 c,
+		rec:               rec,
+		stat1:             &stats[1],
+		compactionContext: newDynamicContext(c.v.levels),
+		minSeq:            minSeq,
+		strict:            db.s.o.GetStrict(opt.StrictCompaction),
+		tableSize:         db.s.o.GetCompactionTableSize(c.sourceLevel + 1),
 	}
 	db.compactionTransact("table@build", b)
 
@@ -631,6 +774,7 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool, done func(*compacti
 	}
 	switch c.typ {
 	case level0Compaction:
+		atomic.AddUint32(&db.level0SubComp, 1)
 		atomic.AddUint32(&db.level0Comp, 1)
 	case nonLevel0Compaction:
 		atomic.AddUint32(&db.nonLevel0Comp, 1)
@@ -669,15 +813,14 @@ func (db *DB) tableRangeCompactionAt(level int, umin, umax []byte) error {
 	var (
 		// The maximum number of compactions are allowed to run concurrently.
 		// The default value is the CPU core number.
-		compLimit = db.s.o.GetCompactionConcurrency()
+		maxConcurrency = db.s.o.GetCompactionConcurrency()
+
+		// The minimal file numbers for sub-level0 compaction. The default
+		// value is 4.
+		minSubLevel0Files = db.s.o.GetMinimalLevel0SubCompactionSize()
 
 		// Compaction context includes all ongoing compactions.
-		ctx = &compactionContext{
-			sorted:   make(map[int][]*compaction),
-			fifo:     make(map[int][]*compaction),
-			icmp:     db.s.icmp,
-			denylist: make(map[int]struct{}),
-		}
+		ctx   = newCompactionContext(maxConcurrency, minSubLevel0Files, db.s.icmp)
 		done  = make(chan *compaction)
 		subWg sync.WaitGroup
 	)
@@ -685,7 +828,7 @@ func (db *DB) tableRangeCompactionAt(level int, umin, umax []byte) error {
 
 	for {
 		var comp *compaction
-		if ctx.count() < compLimit {
+		if ctx.count() < maxConcurrency {
 			comp = db.s.getCompactionRange(ctx, level, umin, umax)
 		}
 		if comp != nil {
@@ -720,7 +863,7 @@ func (db *DB) tableRangeCompactionAt(level int, umin, umax []byte) error {
 					case done <- c:
 					case <-db.closeC:
 					}
-				})
+				}, maxConcurrency, minSubLevel0Files)
 			}()
 		} else {
 			// All overlapped tables have been merged to the parent level
@@ -752,6 +895,16 @@ func (db *DB) resumeWrite() bool {
 	v := db.s.version()
 	defer v.release()
 	if v.tLen(0) < db.s.o.GetWriteL0PauseTrigger() {
+		return true
+	}
+	return false
+}
+
+// resumeWrite returns an indicator whether we should resume write operation if enough level0 files are compacted.
+func (db *DB) writePaused() bool {
+	v := db.s.version()
+	defer v.release()
+	if v.tLen(0) >= db.s.o.GetWriteL0PauseTrigger() {
 		return true
 	}
 	return false
@@ -932,11 +1085,25 @@ func (x *compactionsSortByKey) Less(i, j int) bool {
 }
 
 type compactionContext struct {
-	sorted   map[int][]*compaction
-	fifo     map[int][]*compaction
-	icmp     *iComparer
-	noseek   bool
-	denylist map[int]struct{}
+	maxConcurrency   int
+	minLevel0SubSize int64
+	sorted           map[int][]*compaction
+	fifo             map[int][]*compaction
+	icmp             *iComparer
+	noseek           bool
+	totalWeight      int
+	denylist         map[int]struct{}
+}
+
+func newCompactionContext(maxConcurrency int, minLevel0SubSize int64, icmp *iComparer) *compactionContext {
+	return &compactionContext{
+		maxConcurrency:   maxConcurrency,
+		minLevel0SubSize: minLevel0SubSize,
+		sorted:           make(map[int][]*compaction),
+		fifo:             make(map[int][]*compaction),
+		icmp:             icmp,
+		denylist:         make(map[int]struct{}),
+	}
 }
 
 func (ctx *compactionContext) add(c *compaction) {
@@ -946,6 +1113,7 @@ func (ctx *compactionContext) add(c *compaction) {
 		icmp:        ctx.icmp,
 	})
 	ctx.fifo[c.sourceLevel] = append(ctx.fifo[c.sourceLevel], c)
+	ctx.totalWeight += c.getWeight(ctx.maxConcurrency, ctx.minLevel0SubSize)
 }
 
 func (ctx *compactionContext) delete(c *compaction) {
@@ -962,6 +1130,7 @@ func (ctx *compactionContext) delete(c *compaction) {
 		}
 	}
 	ctx.reset(c.sourceLevel)
+	ctx.totalWeight -= c.getWeight(ctx.maxConcurrency, ctx.minLevel0SubSize)
 	return
 }
 
@@ -984,11 +1153,7 @@ func (ctx *compactionContext) reset(level int) {
 }
 
 func (ctx *compactionContext) count() int {
-	var total int
-	for _, comps := range ctx.sorted {
-		total += len(comps)
-	}
-	return total
+	return ctx.totalWeight
 }
 
 func (ctx *compactionContext) get(level int) []*compaction {
@@ -1030,11 +1195,10 @@ func (ctx *compactionContext) recreating(level int) tFiles {
 // suspension. So this loop will try to maximize the compaction performance by
 // selecting isolated files to compact concurrently.
 //
-// For level0 compaction, concurrency is not allowed. Since we can't guarantee two
-// level0 compactions are non-overlapped. But we do see that level0 compaction in
-// some sense become the bottleneck, it can slow down/suspend write operations if
-// it's not fast enough. Also if level0 compaction can't generate tables fast
-// enough, the non-level0 compactors may become idle.
+// For level0 compaction, it will be divided into several sub-compactions and these
+// sub-compactions can be run concurrently. The compaction efficiency of level0 is
+// the key to the write performance of the entire database. Usually, the big level0
+// compaction is the slowest part.
 //
 // For non-level0 compaction, concurrency is allowed if two compactions are totally
 // isolated.
@@ -1061,15 +1225,14 @@ func (db *DB) tCompaction() {
 	var (
 		// The maximum number of compactions are allowed to run concurrently.
 		// The default value is the CPU core number.
-		compLimit = db.s.o.GetCompactionConcurrency()
+		maxConcurrency = db.s.o.GetCompactionConcurrency()
+
+		// The minimal source size(level0 + level1) for sub-level0 compaction.
+		// The default value is 25 MiB.
+		minLevel0SubSize = db.s.o.GetMinimalLevel0SubCompactionSize()
 
 		// Compaction context includes all ongoing compactions.
-		ctx = &compactionContext{
-			sorted:   make(map[int][]*compaction),
-			fifo:     make(map[int][]*compaction),
-			icmp:     db.s.icmp,
-			denylist: make(map[int]struct{}),
-		}
+		ctx   = newCompactionContext(maxConcurrency, minLevel0SubSize, db.s.icmp)
 		done  = make(chan *compaction)
 		subWg sync.WaitGroup
 
@@ -1080,14 +1243,6 @@ func (db *DB) tCompaction() {
 		rangeCmds []cCmd // Range compaction command list
 	)
 	defer func() {
-		// Panic catcher for potential range compaction.
-		// For all other compactions the panic will be
-		// caught in their own routine.
-		if x := recover(); x != nil {
-			if x != errCompactionTransactExiting {
-				panic(x)
-			}
-		}
 		subWg.Wait()
 		for i := range waitQ {
 			waitQ[i].ack(ErrClosed)
@@ -1100,8 +1255,9 @@ func (db *DB) tCompaction() {
 		if x != nil {
 			x.ack(ErrClosed)
 		}
-		for _, rangeCmd := range rangeCmds {
-			rangeCmd.ack(ErrClosed)
+		for i := range rangeCmds {
+			rangeCmds[i].ack(ErrClosed)
+			rangeCmds[i] = nil
 		}
 		db.closeW.Done()
 	}()
@@ -1121,7 +1277,7 @@ func (db *DB) tCompaction() {
 			level       int
 			table       *tFile
 		)
-		if ctx.count() < compLimit && len(rangeCmds) == 0 {
+		if ctx.count() < maxConcurrency && len(rangeCmds) == 0 {
 			needCompact, level, table = db.tableNeedCompaction(ctx)
 		}
 		if needCompact {
@@ -1187,15 +1343,14 @@ func (db *DB) tCompaction() {
 			x = nil
 			continue
 		}
-		db.runCompaction(ctx, level, table, &subWg, done)
+		db.runCompaction(ctx, level, table, &subWg, done, maxConcurrency, minLevel0SubSize)
 	}
 }
 
-func (db *DB) runCompaction(ctx *compactionContext, level int, table *tFile, wg *sync.WaitGroup, done chan *compaction) {
+func (db *DB) runCompaction(ctx *compactionContext, level int, table *tFile, wg *sync.WaitGroup, done chan *compaction, maxConcurrency int, minLevel0SubSize int64) {
 	var c *compaction
 	if table == nil {
-		c = db.s.pickCompactionByLevel(level, ctx)
-		if c == nil {
+		if c = db.s.pickCompactionByLevel(level, ctx); c == nil {
 			// We can't pick one more isolated compaction in level n.
 			// Mark the entire level as unavailable. In theory it shouldn't
 			// happen a lot.
@@ -1203,8 +1358,7 @@ func (db *DB) runCompaction(ctx *compactionContext, level int, table *tFile, wg 
 			return
 		}
 	} else {
-		c = db.s.pickCompactionByTable(level, table, ctx)
-		if c == nil {
+		if c = db.s.pickCompactionByTable(level, table, ctx); c == nil {
 			// The involved tables are not available now. Mark the seek
 			// compaction as unavailable.
 			ctx.noseek = true
@@ -1230,6 +1384,6 @@ func (db *DB) runCompaction(ctx *compactionContext, level int, table *tFile, wg 
 			case done <- c:
 			case <-db.closeC:
 			}
-		})
+		}, maxConcurrency, minLevel0SubSize)
 	}()
 }

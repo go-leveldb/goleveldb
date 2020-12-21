@@ -137,7 +137,7 @@ func (ik internalKey) String() string {
 	}
 
 	if ukey, seq, kt, err := parseInternalKey(ik); err == nil {
-		return fmt.Sprintf("%s,%s%d", shorten(string(ukey)), kt, seq)
+		return fmt.Sprintf("%s,%s%d", string(ukey), kt, seq)
 	}
 	return fmt.Sprintf("<invalid:%#x>", []byte(ik))
 }

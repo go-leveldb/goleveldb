@@ -959,6 +959,45 @@ func (r *Reader) Get(key []byte, ro *opt.ReadOptions) (value []byte, err error) 
 	return
 }
 
+// KeyInOffset returns the key with approximate offset.
+//
+// Don't modify the returned slice since it's not safe.
+func (r *Reader) KeyInOffset(percentage float64) ([]byte, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if r.err != nil {
+		return nil, r.err
+	}
+
+	indexBlock, rel, err := r.readBlockCached(r.indexBH, true, true)
+	if err != nil {
+		return nil, err
+	}
+	defer rel.Release()
+
+	index := int(float64(indexBlock.restartsLen) * percentage)
+	if index == indexBlock.restartsLen {
+		index = indexBlock.restartsLen - 1
+	}
+	_, val, _, _, err := indexBlock.entry(indexBlock.restartOffset(index))
+	if err != nil {
+		return nil, err
+	}
+
+	dataBH, n := decodeBlockHandle(val)
+	if n == 0 {
+		return nil, r.newErrCorruptedBH(r.indexBH, "bad data block handle")
+	}
+	data := r.getDataIter(dataBH, nil, r.verifyChecksum, false)
+	defer data.Release()
+
+	if !data.First() {
+		return nil, errors.New("empty block")
+	}
+	return data.Key(), nil
+}
+
 // OffsetOf returns approximate offset for the given key.
 //
 // It is safe to modify the contents of the argument after Get returns.
@@ -993,6 +1032,18 @@ func (r *Reader) OffsetOf(key []byte) (offset int64, err error) {
 		offset = r.dataEnd
 	}
 	return
+}
+
+// LastOffset returns the approximate offset for the last key
+func (r *Reader) LastOffset() (offset int64, err error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if r.err != nil {
+		err = r.err
+		return
+	}
+	return r.dataEnd, nil
 }
 
 // Release implements util.Releaser.
