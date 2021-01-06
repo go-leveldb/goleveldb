@@ -23,25 +23,26 @@ const (
 )
 
 var (
-	DefaultBlockCacher                   = LRUCacher
-	DefaultBlockCacheCapacity            = 8 * MiB
-	DefaultBlockRestartInterval          = 16
-	DefaultBlockSize                     = 4 * KiB
-	DefaultCompactionExpandLimitFactor   = 25
-	DefaultCompactionGPOverlapsFactor    = 10
-	DefaultCompactionL0Trigger           = 4
-	DefaultCompactionSourceLimitFactor   = 1
-	DefaultCompactionTableSize           = 2 * MiB
-	DefaultCompactionTableSizeMultiplier = 1.0
-	DefaultCompactionTotalSize           = 10 * MiB
-	DefaultCompactionTotalSizeMultiplier = 10.0
-	DefaultCompressionType               = SnappyCompression
-	DefaultIteratorSamplingRate          = 1 * MiB
-	DefaultOpenFilesCacher               = LRUCacher
-	DefaultWriteBuffer                   = 4 * MiB
-	DefaultWriteL0PauseTrigger           = 12
-	DefaultWriteL0SlowdownTrigger        = 8
-	DefaultFilterBaseLg                  = 11
+	DefaultBlockCacher                    = LRUCacher
+	DefaultBlockCacheCapacity             = 8 * MiB
+	DefaultBlockRestartInterval           = 16
+	DefaultBlockSize                      = 4 * KiB
+	DefaultCompactionExpandLimitFactor    = 25
+	DefaultCompactionGPOverlapsFactor     = 10
+	DefaultCompactionL0Trigger            = 4
+	DefaultCompactionSourceLimitFactor    = 1
+	DefaultCompactionTableSize            = 2 * MiB
+	DefaultCompactionTableSizeMultiplier  = 1.0
+	DefaultCompactionTotalSize            = 10 * MiB
+	DefaultCompactionTotalSizeMultiplier  = 10.0
+	DefaultCompressionType                = SnappyCompression
+	DefaultIteratorSamplingRate           = 1 * MiB
+	DefaultOpenFilesCacher                = LRUCacher
+	DefaultWriteBuffer                    = 4 * MiB
+	DefaultWriteL0PauseTrigger            = 12
+	DefaultWriteL0SlowdownTrigger         = 8
+	DefaultFilterBaseLg                   = 11
+	DefaultMinimalLevel0SubCompactionSize = int64(25 * MiB)
 )
 
 // Cacher is a caching algorithm.
@@ -247,6 +248,13 @@ type Options struct {
 	//
 	// The default value is CPU core number.
 	CompactionConcurrency int
+
+	// MinimalLevel0SubCompactionSize defines the minimal input size involved in
+	// the sub-level0 compaction. The number can be set to a smaller value if the
+	// CompactionConcurrency is big enough.
+	//
+	// The default value is 25 * MiB
+	MinimalLevel0SubCompactionSize int64
 
 	// Comparer defines a total ordering over the space of []byte keys: a 'less
 	// than' relationship. The same comparison algorithm must be used for reads
@@ -507,6 +515,13 @@ func (o *Options) GetCompactionConcurrency() int {
 		return runtime.NumCPU()
 	}
 	return o.CompactionConcurrency
+}
+
+func (o *Options) GetMinimalLevel0SubCompactionSize() int64 {
+	if o == nil || o.MinimalLevel0SubCompactionSize <= 0 {
+		return DefaultMinimalLevel0SubCompactionSize
+	}
+	return o.MinimalLevel0SubCompactionSize
 }
 
 func (o *Options) GetComparer() comparer.Comparer {

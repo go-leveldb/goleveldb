@@ -2568,13 +2568,14 @@ func TestDB_TableCompactionBuilder(t *testing.T) {
 	c := newCompaction(s, v, 1, append(tFiles{}, v.levels[1]...), undefinedCompaction, nil)
 	rec := &sessionRecord{}
 	b := &tableCompactionBuilder{
-		s:         s,
-		c:         c,
-		rec:       rec,
-		stat1:     new(cStatStaging),
-		minSeq:    0,
-		strict:    true,
-		tableSize: o.CompactionTableSize/3 + 961,
+		s:                 s,
+		c:                 c,
+		rec:               rec,
+		stat1:             new(cStatStaging),
+		minSeq:            0,
+		strict:            true,
+		tableSize:         o.CompactionTableSize/3 + 961,
+		compactionContext: newDynamicContext(c.v.levels),
 	}
 	if err := b.run(new(compactionTransactCounter)); err != nil {
 		t.Fatal(err)
@@ -2592,13 +2593,14 @@ func TestDB_TableCompactionBuilder(t *testing.T) {
 	c = newCompaction(s, v, 0, append(tFiles{}, v.levels[0]...), undefinedCompaction, nil)
 	rec = &sessionRecord{}
 	b = &tableCompactionBuilder{
-		s:         s,
-		c:         c,
-		rec:       rec,
-		stat1:     new(cStatStaging),
-		minSeq:    0,
-		strict:    true,
-		tableSize: o.CompactionTableSize,
+		s:                 s,
+		c:                 c,
+		rec:               rec,
+		stat1:             new(cStatStaging),
+		minSeq:            0,
+		strict:            true,
+		tableSize:         o.CompactionTableSize,
+		compactionContext: newDynamicContext(c.v.levels),
 	}
 	if err := b.run(new(compactionTransactCounter)); err != nil {
 		t.Fatal(err)
@@ -2636,13 +2638,14 @@ func TestDB_TableCompactionBuilder(t *testing.T) {
 	c = newCompaction(s, v, 1, append(tFiles{}, v.levels[1]...), undefinedCompaction, nil)
 	rec = &sessionRecord{}
 	b = &tableCompactionBuilder{
-		s:         s,
-		c:         c,
-		rec:       rec,
-		stat1:     new(cStatStaging),
-		minSeq:    0,
-		strict:    true,
-		tableSize: o.CompactionTableSize,
+		s:                 s,
+		c:                 c,
+		rec:               rec,
+		stat1:             new(cStatStaging),
+		minSeq:            0,
+		strict:            true,
+		tableSize:         o.CompactionTableSize,
+		compactionContext: newDynamicContext(c.v.levels),
 	}
 	stor.EmulateErrorOnce(testutil.ModeSync, storage.TypeTable, errors.New("table sync error (once)"))
 	stor.EmulateRandomError(testutil.ModeRead|testutil.ModeWrite, storage.TypeTable, 0.01, errors.New("table random IO error"))

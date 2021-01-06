@@ -40,6 +40,7 @@ type DB struct {
 
 	// Compaction statistic
 	memComp       uint32 // The cumulative number of memory compaction
+	level0SubComp uint32 // The cumulative number of memory compaction
 	level0Comp    uint32 // The cumulative number of level0 compaction
 	nonLevel0Comp uint32 // The cumulative number of non-level0 compaction
 	seekComp      uint32 // The cumulative number of seek compaction
@@ -1047,6 +1048,7 @@ type DBStats struct {
 	LevelDurations    []time.Duration
 
 	MemComp       uint32
+	Level0SubComp uint32
 	Level0Comp    uint32
 	NonLevel0Comp uint32
 	SeekComp      uint32
@@ -1094,6 +1096,7 @@ func (db *DB) Stats(s *DBStats) error {
 		s.LevelTablesCounts = append(s.LevelTablesCounts, len(tables))
 	}
 	s.MemComp = atomic.LoadUint32(&db.memComp)
+	s.Level0SubComp = atomic.LoadUint32(&db.level0SubComp)
 	s.Level0Comp = atomic.LoadUint32(&db.level0Comp)
 	s.NonLevel0Comp = atomic.LoadUint32(&db.nonLevel0Comp)
 	s.SeekComp = atomic.LoadUint32(&db.seekComp)

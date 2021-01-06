@@ -7,11 +7,18 @@
 package leveldb
 
 import (
+	"bytes"
+	"fmt"
 	"sort"
+	"sync"
 
+	"github.com/go-leveldb/goleveldb/leveldb/cache"
+	"github.com/go-leveldb/goleveldb/leveldb/errors"
 	"github.com/go-leveldb/goleveldb/leveldb/iterator"
 	"github.com/go-leveldb/goleveldb/leveldb/memdb"
 	"github.com/go-leveldb/goleveldb/leveldb/opt"
+	"github.com/go-leveldb/goleveldb/leveldb/table"
+	"github.com/go-leveldb/goleveldb/leveldb/util"
 )
 
 const (
@@ -291,33 +298,18 @@ func newCompaction(s *session, v *version, sourceLevel int, t0 tFiles, typ int, 
 		sourceLevel:   sourceLevel,
 		levels:        [2]tFiles{t0, nil},
 		maxGPOverlaps: int64(s.o.GetCompactionGPOverlaps(sourceLevel)),
-		tPtrs:         make([]int, len(v.levels)),
 	}
 	if !c.expand(ctx) {
 		return nil
 	}
-	c.save()
 	return c
 }
 
-// compaction represent a compaction state.
-type compaction struct {
-	s *session
-	v *version
-
-	id            int64
-	typ           int
-	sourceLevel   int
-	levels        [2]tFiles
-	maxGPOverlaps int64
-
-	gp                tFiles
+type compactionDynamicContext struct {
 	gpi               int
 	seenKey           bool
 	gpOverlappedBytes int64
-	imin, imax        internalKey
 	tPtrs             []int
-	released          bool
 
 	snapGPI               int
 	snapSeenKey           bool
@@ -325,18 +317,89 @@ type compaction struct {
 	snapTPtrs             []int
 }
 
-func (c *compaction) save() {
-	c.snapGPI = c.gpi
-	c.snapSeenKey = c.seenKey
-	c.snapGPOverlappedBytes = c.gpOverlappedBytes
-	c.snapTPtrs = append(c.snapTPtrs[:0], c.tPtrs...)
+func newDynamicContext(levels []tFiles) *compactionDynamicContext {
+	return &compactionDynamicContext{
+		tPtrs:     make([]int, len(levels)),
+		snapTPtrs: make([]int, len(levels)),
+	}
 }
 
-func (c *compaction) restore() {
-	c.gpi = c.snapGPI
-	c.seenKey = c.snapSeenKey
-	c.gpOverlappedBytes = c.snapGPOverlappedBytes
-	c.tPtrs = append(c.tPtrs[:0], c.snapTPtrs...)
+func (ctx *compactionDynamicContext) save() {
+	ctx.snapGPI = ctx.gpi
+	ctx.snapSeenKey = ctx.seenKey
+	ctx.snapGPOverlappedBytes = ctx.gpOverlappedBytes
+	ctx.snapTPtrs = append(ctx.snapTPtrs[:0], ctx.tPtrs...)
+}
+
+func (ctx *compactionDynamicContext) restore() {
+	ctx.gpi = ctx.snapGPI
+	ctx.seenKey = ctx.snapSeenKey
+	ctx.gpOverlappedBytes = ctx.snapGPOverlappedBytes
+	ctx.tPtrs = append(ctx.tPtrs[:0], ctx.snapTPtrs...)
+}
+
+// baseLevelForKey reports whether the given user-key is already in the
+// bottom-most level. Also this function will update the internal state
+// for speeding up the overall performance.
+// The assumption is held here the given user-keys are monotonic increasing.
+func (ctx *compactionDynamicContext) baseLevelForKey(sourceLevel int, levels []tFiles, icmp *iComparer, ukey []byte) bool {
+	for level := sourceLevel + 2; level < len(levels); level++ {
+		tables := levels[level]
+		for ctx.tPtrs[level] < len(tables) {
+			t := tables[ctx.tPtrs[level]]
+			if icmp.uCompare(ukey, t.imax.ukey()) <= 0 {
+				// We've advanced far enough.
+				if icmp.uCompare(ukey, t.imin.ukey()) >= 0 {
+					// Key falls in this file's range, so definitely not base level.
+					return false
+				}
+				break
+			}
+			ctx.tPtrs[level]++
+		}
+	}
+	return true
+}
+
+// shouldStopBefore reports whether the overlap between the current table
+// with the parent level is large enough. If so the table rotation is expected.
+// Also this function will update the internal state for speeding up the
+// overal performance.
+func (ctx *compactionDynamicContext) shouldStopBefore(gp tFiles, icmp *iComparer, maxGPOverlaps int64, ikey internalKey) bool {
+	for ; ctx.gpi < len(gp); ctx.gpi++ {
+		gp := gp[ctx.gpi]
+		if icmp.Compare(ikey, gp.imax) <= 0 {
+			break
+		}
+		if ctx.seenKey {
+			ctx.gpOverlappedBytes += gp.size
+		}
+	}
+	ctx.seenKey = true
+
+	if ctx.gpOverlappedBytes > maxGPOverlaps {
+		// Too much overlap for current output; start new output.
+		ctx.gpOverlappedBytes = 0
+		return true
+	}
+	return false
+}
+
+// compaction represent a compaction state. It's immutable(except
+// the released field), so it's totally safe to share it with multiple
+// sub-compaction threads.
+type compaction struct {
+	s             *session
+	v             *version
+	id            int64
+	typ           int
+	sourceLevel   int
+	levels        [2]tFiles
+	maxGPOverlaps int64
+	gp            tFiles
+	imin, imax    internalKey
+	released      bool
+	weight        int
 }
 
 func (c *compaction) release() {
@@ -434,47 +497,229 @@ func (c *compaction) trivial() bool {
 	return len(c.levels[0]) == 1 && len(c.levels[1]) == 0 && c.gp.size() <= c.maxGPOverlaps
 }
 
-func (c *compaction) baseLevelForKey(ukey []byte) bool {
-	for level := c.sourceLevel + 2; level < len(c.v.levels); level++ {
-		tables := c.v.levels[level]
-		for c.tPtrs[level] < len(tables) {
-			t := tables[c.tPtrs[level]]
-			if c.s.icmp.uCompare(ukey, t.imax.ukey()) <= 0 {
-				// We've advanced far enough.
-				if c.s.icmp.uCompare(ukey, t.imin.ukey()) >= 0 {
-					// Key falls in this file's range, so definitely not base level.
-					return false
-				}
-				break
-			}
-			c.tPtrs[level]++
-		}
+// getWeight returns the weight of compaction. It's used in the concurrent compaction limiter.
+// The weight of non-level0 compaction is 1 by default seems they won't be divided into
+// smaller sub-compaction. The weight of level0 compaction is determined by the compaction
+// size.
+func (c *compaction) getWeight(maxConcurrency int, minLevel0SubCompactionSize int64) int {
+	if c.weight != 0 {
+		return c.weight
 	}
-	return true
+	if c.sourceLevel != 0 {
+		c.weight = 1
+	} else {
+		// The level0 compaction weight doesn't have to be
+		// very accurate, seems the concurrency may be changed
+		// in the real run. But it's fine.
+		c.weight = c.calculateConcurrency(maxConcurrency, minLevel0SubCompactionSize)
+	}
+	return c.weight
 }
 
-func (c *compaction) shouldStopBefore(ikey internalKey) bool {
-	for ; c.gpi < len(c.gp); c.gpi++ {
-		gp := c.gp[c.gpi]
-		if c.s.icmp.Compare(ikey, gp.imax) <= 0 {
-			break
-		}
-		if c.seenKey {
-			c.gpOverlappedBytes += gp.size
+// calculateConcurrency calculates the suitable concurrency for level0 compaction.
+// The concurrency is determined by the concurrency upper limit and the minimal
+// sub-compaction size required.
+// The result is not very accurate. It's just the approximate value based on the
+// approximate table size(the actual key-value size is smaller).
+func (c *compaction) calculateConcurrency(maxConcurrency int, minLevel0SubSize int64) int {
+	var total int64
+	for _, tables := range c.levels {
+		for _, t := range tables {
+			total += t.size
 		}
 	}
-	c.seenKey = true
+	if total <= minLevel0SubSize {
+		return 1
+	}
+	groupSize := minLevel0SubSize
+	if int64(maxConcurrency)*minLevel0SubSize < total {
+		groupSize = (total-1)/int64(maxConcurrency) + 1
+	}
+	concurrency := (total-1)/groupSize + 1
+	return int(concurrency)
+}
 
-	if c.gpOverlappedBytes > c.maxGPOverlaps {
-		// Too much overlap for current output; start new output.
-		c.gpOverlappedBytes = 0
-		return true
+// calculateRanges splits the entire key range into several small ones for
+// concurrent compaction. Note this function is only meaningful for level0
+// compaction.
+//
+// The function has two main goals:
+// - Select a suitable concurrency for the compaction
+// - Ensure the workload is distributed evenly in each sub compaction
+func (c *compaction) calculateRanges(maxConcurrency int, minLevel0SubSize int64) (ranges []*util.Range, err error) {
+	// Short circuit if it's non-level0 compaction
+	if c.sourceLevel != 0 {
+		return nil, nil
 	}
-	return false
+	// Short circuit if the level1 is empty. It can happen
+	// if leveldb tries to recover itself from losing manifest
+	// or the first level0 compaction. todo should be fixed
+	if len(c.levels[1]) == 0 {
+		return nil, nil
+	}
+	// Short circuit if the compaction source size is too small
+	concurrency := c.calculateConcurrency(maxConcurrency, minLevel0SubSize)
+	if concurrency == 1 {
+		return []*util.Range{{}}, nil
+	}
+	var (
+		handlers = [2][]*cache.Handle{}
+		offsets  = make([]int64, len(c.levels[0]))
+		sizes    = make([]int64, len(c.levels[1]))
+	)
+	// Preopen all the source level files
+	for level, tables := range c.levels {
+		for _, table := range tables {
+			ch, err := c.s.tops.open(table)
+			if err != nil {
+				return nil, err
+			}
+			handlers[level] = append(handlers[level], ch)
+		}
+	}
+	// Release all opened files in the end of the function
+	defer func() {
+		for _, hs := range handlers {
+			for _, h := range hs {
+				h.Release()
+			}
+		}
+	}()
+	// Calculate the source size falls in the key range of each parent level file.
+	// - if it's the first file in the parent level, the key range stops before the
+	//   first entry in the next file(the first entry is excluded)
+	// - if it's the last file in the parent level, the key range starts from the first
+	//   entry in the last file (the first entry is included)
+	// - otherwise
+	// 	 - the start is the separator of the last entry in the last file and
+	// 	   the first entry in the current file, start is included by default.
+	//   - the limit is the separator of the last entry in the current file and
+	//     the first entry in the next file, limit is excluded by default.
+	for i := 0; i < len(c.levels[1]); i++ {
+		var (
+			wg     sync.WaitGroup
+			isLast = i == len(c.levels[1])-1
+			subs   = make([]int64, len(c.levels[0]))
+			errs   = make([]error, len(c.levels[0]))
+		)
+		for child := 0; child < len(c.levels[0]); child++ {
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+				if isLast {
+					offset, err := handlers[0][index].Value().(*table.Reader).LastOffset()
+					if err != nil {
+						errs[index] = err
+						return
+					}
+					subs[index] = offset - offsets[index]
+					if subs[index] < 0 {
+						panic(fmt.Sprintf("negative size %v", subs[index]))
+					}
+					offsets[index] = offset
+				} else {
+					limit := c.levels[1][i+1].imin
+					offset, err := handlers[0][index].Value().(*table.Reader).OffsetOf(limit)
+					if err != nil {
+						errs[index] = err
+						return
+					}
+					subs[index] = offset - offsets[index]
+					if subs[index] < 0 {
+						panic(fmt.Sprintf("negative size %v", subs[index]))
+					}
+					offsets[index] = offset
+				}
+			}(child)
+		}
+		wg.Wait()
+
+		for child := 0; child < len(c.levels[0]); child++ {
+			if errs[child] != nil {
+				return nil, errs[child]
+			}
+			sizes[i] += subs[child]
+		}
+	}
+	// Split the parent level files into several groups. The size splitting is
+	// not accurate here, just for the rough partition.
+	// The extreme imbalance can happen if there is a big key-space gap. Still
+	// needs to figure a better way for partition.
+	var (
+		group     int64
+		groupSize int64
+		totalSize int64
+		lastKey   []byte
+	)
+	for _, size := range sizes {
+		totalSize += size
+	}
+	groupSize = (totalSize-1)/int64(concurrency) + 1
+
+	for i, size := range sizes {
+		if group+size <= groupSize {
+			group += size
+			continue
+		}
+		var divided int64
+		for {
+			key, err := handlers[1][i].Value().(*table.Reader).KeyInOffset(float64(groupSize-group+divided) / float64(size))
+			if err != nil {
+				return nil, err
+			}
+			if len(key) == 0 {
+				return nil, errors.New("empty key")
+			}
+			if c.s.icmp.Compare(key, c.levels[1][i].imax) > 0 {
+				panic(fmt.Sprintf("key %v max %v", []byte(key), []byte(c.levels[1][i].imax)))
+			}
+			if lastKey != nil && bytes.Equal(lastKey, key) {
+				fmt.Printf("SAME KEY last %v current %v min %v max %v, size %v, fsize %v, divided %v, group %v, groupsize %v percent %f\n",
+					lastKey, key, []byte(c.levels[1][i].imin), []byte(c.levels[1][i].imax), size, c.levels[1][i].size, divided, group, groupSize, float64(groupSize-group+divided)/float64(size))
+				divided += groupSize - group
+				group = 0
+				if size-divided < groupSize {
+					group = size - divided
+					break
+				}
+				continue
+			}
+
+			r := &util.Range{}
+			if lastKey != nil {
+				r.Start = append([]byte{}, lastKey...)
+			}
+			r.Limit = append([]byte{}, key...)
+			ranges = append(ranges, r)
+
+			if lastKey != nil && c.s.icmp.Compare(lastKey, key) >= 0 {
+				panic(fmt.Sprintf("i %d last %v key %v min %v max %v, size %v, fsize %v, divided %v, group %v, groupsize %v percent %f",
+					i, lastKey, key, []byte(c.levels[1][i].imin), []byte(c.levels[1][i].imax), size, c.levels[1][i].size, divided, group, groupSize, float64(groupSize-group+divided)/float64(size)))
+			}
+			lastKey = r.Limit
+
+			divided += groupSize - group
+			group = 0
+			if size-divided < groupSize {
+				group = size - divided
+				break
+			}
+		}
+	}
+	// If the last group is too small, merge it
+	if group < groupSize/2 && len(ranges) > 0 {
+		ranges[len(ranges)-1].Limit = nil
+	} else {
+		ranges = append(ranges, &util.Range{
+			Start: lastKey,
+			Limit: nil,
+		})
+	}
+	return ranges, nil
 }
 
 // Creates an iterator.
-func (c *compaction) newIterator() iterator.Iterator {
+func (c *compaction) newIterator(start, limit []byte) iterator.Iterator {
 	// Creates iterator slice.
 	icap := len(c.levels)
 	if c.sourceLevel == 0 {
@@ -484,6 +729,8 @@ func (c *compaction) newIterator() iterator.Iterator {
 	its := make([]iterator.Iterator, 0, icap)
 
 	// Options.
+
+	// TODO the index block can't be shared by sub-compactors
 	ro := &opt.ReadOptions{
 		DontFillCache: true,
 		Strict:        opt.StrictOverride,
@@ -501,10 +748,16 @@ func (c *compaction) newIterator() iterator.Iterator {
 		// Level-0 is not sorted and may overlaps each other.
 		if c.sourceLevel+i == 0 {
 			for _, t := range tables {
-				its = append(its, c.s.tops.newIterator(t, nil, ro))
+				its = append(its, c.s.tops.newIterator(t, &util.Range{
+					Start: start,
+					Limit: limit,
+				}, ro))
 			}
 		} else {
-			it := iterator.NewIndexedIterator(tables.newIndexIterator(c.s.tops, c.s.icmp, nil, ro), strict)
+			it := iterator.NewIndexedIterator(tables.newIndexIterator(c.s.tops, c.s.icmp, &util.Range{
+				Start: start,
+				Limit: limit,
+			}, ro), strict)
 			its = append(its, it)
 		}
 	}
